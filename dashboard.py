@@ -99,6 +99,8 @@ if "pending_symbol_update" not in st.session_state:
     st.session_state.pending_symbol_update = None
 if "pending_alias_update" not in st.session_state:
     st.session_state.pending_alias_update = None
+if "pending_strat_update" not in st.session_state:
+    st.session_state.pending_strat_update = None
 
 st.session_state.auth_trace.append(f"Run started at {datetime.now().strftime('%H:%M:%S')}")
 
@@ -108,14 +110,30 @@ if st.session_state.pending_market_selector_update is not None:
     st.session_state.pending_market_selector_update = None
 
 if st.session_state.pending_symbol_update is not None:
-    m_key = f"{st.session_state.pending_symbol_update['m_code'].lower()}_symbol_sel"
-    st.session_state[m_key] = st.session_state.pending_symbol_update['symbol']
+    p = st.session_state.pending_symbol_update
+    m_key = f"{p['m_code'].lower()}_{p['strat'].lower()}_symbol_sel"
+    st.session_state[m_key] = p['symbol']
+    slot_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
+    if slot_key not in st.session_state:
+        st.session_state[slot_key] = {}
+    st.session_state[slot_key]['symbol'] = p['symbol']
     st.session_state.pending_symbol_update = None
 
 if st.session_state.pending_alias_update is not None:
-    m_key = f"{st.session_state.pending_alias_update['m_code'].lower()}_alias_sel"
-    st.session_state[m_key] = st.session_state.pending_alias_update['alias']
+    p = st.session_state.pending_alias_update
+    m_key = f"{p['m_code'].lower()}_{p['strat'].lower()}_alias_sel"
+    st.session_state[m_key] = p['alias']
+    slot_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
+    if slot_key not in st.session_state:
+        st.session_state[slot_key] = {}
+    st.session_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
+    st.session_state[slot_key]['alias'] = p['alias']
     st.session_state.pending_alias_update = None
+
+if st.session_state.pending_strat_update is not None:
+    m_key = f"{st.session_state.pending_strat_update['m_code'].lower()}_strat"
+    st.session_state[m_key] = st.session_state.pending_strat_update['strat']
+    st.session_state.pending_strat_update = None
 
 # 자동 로그아웃 체크 (1시간 = 3600초)
 if st.session_state.authenticated:
@@ -328,29 +346,29 @@ def format_ticker_display(t, m_code):
         return f"{t} ({name})"
     return t
 
+# 1. 심박 확인 (30초마다 독립적으로 갱신되는 프래그먼트)
+@st.fragment(run_every=30)
+def display_heartbeat():
+    last_hb_str = get_config("scheduler_heartbeat")
+    is_alive = False
+    if last_hb_str:
+        try:
+            last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S")
+            # 2분 이내에 심박이 있으면 살아있는 것으로 간주
+            if datetime.now() - last_hb < timedelta(minutes=2):
+                is_alive = True
+        except:
+            pass
+            
+    if is_alive:
+        st.success(f"프로세스 동작 중 (Heartbeat: {last_hb_str.split()[-1]})")
+    else:
+        st.error("프로세스 응답 없음 (scheduler.py 실행 필요)")
+
 # --- 사이드바 스케줄러 제어 ---
 def display_scheduler_control():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🕹️ 스케줄러 제어")
-
-    # 1. 심박 확인 (30초마다 독립적으로 갱신되는 프래그먼트)
-    @st.fragment(run_every=30)
-    def display_heartbeat():
-        last_hb_str = get_config("scheduler_heartbeat")
-        is_alive = False
-        if last_hb_str:
-            try:
-                last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S")
-                # 2분 이내에 심박이 있으면 살아있는 것으로 간주
-                if datetime.now() - last_hb < timedelta(minutes=2):
-                    is_alive = True
-            except:
-                pass
-                
-        if is_alive:
-            st.success(f"프로세스 동작 중 (Heartbeat: {last_hb_str.split()[-1]})")
-        else:
-            st.error("프로세스 응답 없음 (scheduler.py 실행 필요)")
 
     with st.sidebar:
         display_heartbeat()
@@ -369,16 +387,6 @@ def display_scheduler_control():
     status_msg = "🟢 가동 중 (Running)" if current_status == "running" else "🔴 정지됨 (Stopped)"
     st.sidebar.info(f"상태: **{status_msg}**")
 
-    # 2.1 주문 실행 모드 (Manual vs Auto)
-    st.sidebar.markdown("---")
-    plan_mode = get_config("planning_mode", "manual")
-    new_plan_mode = st.sidebar.radio("주문 실행 모드", ["manual", "auto"], 
-                                     index=0 if plan_mode == "manual" else 1,
-                                     help="auto 설정 시 스케줄러가 장 시작 전 자동으로 주문을 전송합니다.")
-    if new_plan_mode != plan_mode:
-        set_config("planning_mode", new_plan_mode)
-        st.rerun()
-
     # 3. 수동 실행 (Manual Trigger with Preview)
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚡ 수동 주문 제어")
@@ -392,7 +400,7 @@ def display_scheduler_control():
         planned = []
         
         # CA 전략 프리뷰
-        if get_config("enable_ca", "true") == "true":
+        try:
             ca_states = get_all_states_db("CA", market=market_code, strategy_name=strategy_alias)
             for state in ca_states:
                 sym = state.get('symbol')
@@ -406,9 +414,11 @@ def display_scheduler_control():
                         planned.extend(orders)
                 except Exception as e:
                     st.sidebar.error(f"{sym} CA 계획 생성 오류: {e}")
+        except Exception as ex:
+            st.sidebar.error(f"CA 전략 조회 오류: {ex}")
         
         # VR 전략 프리뷰
-        if get_config("enable_vr", "false") == "true":
+        try:
             vr_states = get_all_states_db("VR", market=market_code, strategy_name=strategy_alias)
             for state in vr_states:
                 sym = state.get('symbol')
@@ -416,12 +426,13 @@ def display_scheduler_control():
                     cfg = VRConfig(symbol=sym, use_db=True, market=market_code, strategy_name=state.get('strategy_name'))
                     eng = ValueRebalancingEngine(cfg, broker=ActiveBroker)
                     # preview=True
-                    # VR은 주기에 따라 contribution이 달라지는데, 수동 실행 시 기본적으로 0으로 둠 (혹은 오늘 날짜 체크)
                     orders = eng.place_daily_limit_orders(datetime.now(), contribution=0.0, is_cycle_start_day=False, check_existing_orders=True, preview=True)
                     if orders:
                         planned.extend(orders)
                 except Exception as e:
                     st.sidebar.error(f"{sym} VR 계획 생성 오류: {e}")
+        except Exception as ex:
+            st.sidebar.error(f"VR 전략 조회 오류: {ex}")
         
         st.session_state.planned_orders = planned
         if not planned:
@@ -429,24 +440,6 @@ def display_scheduler_control():
         else:
             st.sidebar.success(f"총 {len(planned)}건의 주문 계획이 생성되었습니다.")
             st.rerun() # 메인 화면 갱신을 위해 리런
-
-    # 4. 전략별 활성화 설정 (토글)
-    st.sidebar.markdown("---")
-    st.sidebar.caption("자동매매 대상 전략")
-    
-    # CA 설정
-    ca_enabled = get_config("enable_ca", "true") == "true"
-    new_ca = st.sidebar.checkbox("CA 전략 실행", value=ca_enabled)
-    if new_ca != ca_enabled:
-        set_config("enable_ca", "true" if new_ca else "false")
-        st.rerun()
-        
-    # VR 설정 (기본값 False)
-    vr_enabled = get_config("enable_vr", "false") == "true"
-    new_vr = st.sidebar.checkbox("VR 전략 실행", value=vr_enabled)
-    if new_vr != vr_enabled:
-        set_config("enable_vr", "true" if new_vr else "false")
-        st.rerun()
 
 # 사이드바 상태 요약 표시 함수
 def display_sidebar_summary(m_display, m_code):
@@ -498,23 +491,62 @@ def display_sidebar_summary(m_display, m_code):
 
 with st.sidebar:
     st.title("🚀 키움CAVR 컨트롤 패널")
+    st.write(f"👤 **{st.session_state.get('username', 'Investor')}**님 환영합니다.")
     
-    # --- 거래 운영 모드 (실전 vs 모의) 선택 및 저장 ---
-    current_trade_mode = get_trade_mode()
-    mode_options = ["실전 투자 (REAL)", "모의 투자 (MOCK)"]
-    def_mode_idx = 1 if current_trade_mode == "MOCK" else 0
-    active_mode_display = st.selectbox("운영 모드 선택", mode_options, index=def_mode_idx, key="trade_mode_selector_ui")
-    active_mode = "MOCK" if active_mode_display == "모의 투자 (MOCK)" else "REAL"
-    
-    if active_mode != current_trade_mode:
-        set_config("TRADE_MODE", active_mode)
-        st.success(f"거래 모드가 {active_mode}로 변경되었습니다. 시스템을 재시작합니다.")
-        time.sleep(1)
-        st.rerun()
+    st.write("### 🎛️ 시스템 운영 설정")
+    with st.container(border=True):
+        # 1행: 운영 모드 & 활성 시장
+        r1_col1, r1_col2 = st.columns(2)
+        with r1_col1:
+            current_trade_mode = get_trade_mode()
+            mode_options = ["실전 투자", "모의 투자"]
+            def_mode_idx = 1 if current_trade_mode == "MOCK" else 0
+            active_mode_display = st.radio("🏷️ 운영 모드", mode_options, index=def_mode_idx, key="trade_mode_selector_ui")
+            active_mode = "MOCK" if active_mode_display == "모의 투자" else "REAL"
+            
+            if active_mode != current_trade_mode:
+                set_config("TRADE_MODE", active_mode)
+                # 조기 리런 시 market_selector 세션 상태 소실 방지를 위해 대기 업데이트에 백업
+                if "market_selector" in st.session_state:
+                    st.session_state["pending_market_selector_update"] = st.session_state["market_selector"]
+                    
+                # Clear live_account cache when switching trade mode!
+                if 'live_account' in st.session_state:
+                    del st.session_state['live_account']
+                st.success(f"거래 모드 변경됨: {active_mode}")
+                time.sleep(1)
+                st.rerun()
 
-    active_market_display = st.selectbox("활성 시장 선택 (운영 대상)", ["미국 시장", "한국 시장"], key="market_selector")
-    active_market_code = "US" if active_market_display == "미국 시장" else "KR"
-    
+        with r1_col2:
+            active_market_display = st.radio("🌐 활성 시장", ["미국 시장", "한국 시장"], key="market_selector")
+            active_market_code = "US" if active_market_display == "미국 시장" else "KR"
+            m_lower = active_market_code.lower()
+            
+        st.divider() # 행 구분선
+        
+        # 2행: 방법론 & 실행 모드
+        r2_col1, r2_col2 = st.columns(2)
+        with r2_col1:
+            t_mode = active_mode.lower()
+            prev_strat = st.session_state.get(f"{t_mode}_{m_lower}_strat")
+            if not prev_strat:
+                if st.session_state.user_email:
+                    db_strat_key = f"last_strategy_{st.session_state.user_email}_{active_mode}_{active_market_code}"
+                    prev_strat = get_config(db_strat_key, None)
+                if not prev_strat:
+                    prev_strat = st.session_state.get("last_loaded_strategy_choice", "CA")
+                    
+            strat_key = f"{t_mode}_{m_lower}_strat"
+            if strat_key not in st.session_state:
+                st.session_state[strat_key] = prev_strat
+            
+            s_choice = st.radio("📈 방법론", ["CA", "VR"], key=strat_key)
+
+        with r2_col2:
+            # 실행 모드 선택 (투자 실행 vs 백테스트)
+            mode_key = f"{t_mode}_{m_lower}_run_mode"
+            s_mode = st.radio("🎯 실행 모드", ["투자 실행", "백테스트"], key=mode_key)
+
     # --- Broker 및 Currency Symbol 정의 (한 번만) ---
     @st.cache_resource
     def get_active_broker_instance(market_code_param: str, mode: str):
@@ -526,18 +558,30 @@ with st.sidebar:
             return KiwoomUsBroker()
 
     ActiveBroker = get_active_broker_instance(active_market_code, active_mode)
+    
+    # 감지: 모드나 시장이 달라졌다면 live_account 캐시 클리어
+    if "last_active_market_code" not in st.session_state:
+        st.session_state["last_active_market_code"] = active_market_code
+    if "last_active_mode" not in st.session_state:
+        st.session_state["last_active_mode"] = active_mode
+        
+    if st.session_state["last_active_market_code"] != active_market_code or st.session_state["last_active_mode"] != active_mode:
+        if 'live_account' in st.session_state:
+            del st.session_state['live_account']
+        st.session_state["last_active_market_code"] = active_market_code
+        st.session_state["last_active_mode"] = active_mode
+
     currency_symbol = "₩" if active_market_code == "KR" else "$"
     # --- Broker 및 Currency Symbol 정의 끝 ---
 
     st.divider()
     
-    def render_strategy_settings(m_code):
+    def render_strategy_settings(m_code, s_choice, s_mode):
         m_lower = m_code.lower()
         m_curr = "₩" if m_code == "KR" else "$"
         
         st.subheader(f"📍 {m_code} 전략 설정")
-        
-        s_choice = st.radio("전략 선택", ["CA", "VR"], horizontal=True, key=f"{m_lower}_strat")
+        t_mode = get_trade_mode().lower()
 
         # --- 종목 선택 (신규 입력 기능 추가) ---
         m_tickers = get_market_tickers(m_code)
@@ -551,10 +595,40 @@ with st.sidebar:
             n = m_tickers.get(t, "")
             return f"{n} ({t})" if n and n != t else t
             
-        # 세션 상태에서 이전 종목 인덱스 찾기
-        prev_symbol = st.session_state.get("last_loaded_symbol")
+        # [8구획 독립 UI 상태 복원]
+        target_key = f"target_{t_mode}_{m_lower}_{s_choice.lower()}"
+        if target_key not in st.session_state:
+            if st.session_state.user_email:
+                db_key = f"ui_target_{st.session_state.user_email}_{get_trade_mode()}_{s_choice}_{m_code}"
+                saved_val = get_config(db_key, None)
+                if saved_val:
+                    try:
+                        import json
+                        parsed = json.loads(saved_val)
+                        st.session_state[target_key] = parsed
+                    except:
+                        st.session_state[target_key] = {"symbol": "", "alias": ""}
+                else:
+                    st.session_state[target_key] = {"symbol": "", "alias": ""}
+            else:
+                st.session_state[target_key] = {"symbol": "", "alias": ""}
+
+        prev_symbol = st.session_state[target_key].get("symbol")
+        if not prev_symbol:
+            env_suffix = m_code.lower()
+            env_path = os.path.join(PROJECT_ROOT, "env", f".env.{env_suffix}")
+            if os.path.exists(env_path):
+                from dotenv import dotenv_values
+                env_config = dotenv_values(env_path)
+                prev_symbol = env_config.get("ticker", "SOXL" if m_code == "US" else "122630")
+            else:
+                prev_symbol = "SOXL" if m_code == "US" else "122630"
+        
         def_sym_idx = t_options_with_new.index(prev_symbol) if prev_symbol in t_options_with_new else 0
-        selected_symbol_opt = st.selectbox("종목 선택", t_options_with_new, index=def_sym_idx, format_func=fmt_t_symbol, key=f"{m_lower}_symbol_sel")
+        widget_key = f"{t_mode}_{m_lower}_{s_choice.lower()}_symbol_sel"
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = t_options_with_new[def_sym_idx]
+        selected_symbol_opt = st.selectbox("종목 선택", t_options_with_new, format_func=fmt_t_symbol, key=widget_key)
 
         s_symbol = "" # s_symbol 초기화
         if selected_symbol_opt == "--- 신규 입력 ---":
@@ -626,7 +700,9 @@ with st.sidebar:
             s_symbol = st.session_state.get(f"{m_lower}_pending_ticker", "")
         else:
             s_symbol = selected_symbol_opt
-        s_mode = st.radio("실행 모드", ["실전 투자", "백테스트"], key=f"{m_lower}_mode", horizontal=True)
+        
+        # s_mode가 "투자 실행"인 경우 내부 비즈니스 로직 연동을 위해 "실전 투자"로 변환
+        internal_mode = "실전 투자" if s_mode == "투자 실행" else "백테스트"
 
         # --- 저장된 전략 목록 불러오기 로직 추가 ---
         existing_states = get_all_states_db(strategy_type=s_choice, market=m_code)
@@ -639,22 +715,28 @@ with st.sidebar:
         alias_options = ["--- 신규 입력 ---"] + existing_aliases # 기존 별칭 선택 또는 신규 입력
         
         # 세션 상태에서 이전 별칭 인덱스 찾기
-        prev_alias = st.session_state.get("last_loaded_alias")
+        prev_alias = st.session_state[target_key].get("alias")
         default_idx = alias_options.index(prev_alias) if prev_alias in alias_options else (1 if existing_aliases else 0)
-        selected_alias_opt = st.selectbox("📁 저장된 전략 선택", alias_options, index=default_idx, key=f"{m_lower}_alias_sel")
+        
+        alias_widget_key = f"{t_mode}_{m_lower}_{s_choice.lower()}_alias_sel"
+        if alias_widget_key not in st.session_state:
+            st.session_state[alias_widget_key] = alias_options[default_idx]
+        selected_alias_opt = st.selectbox("📁 저장된 전략 선택", alias_options, key=alias_widget_key)
         
         if selected_alias_opt == "--- 신규 입력 ---":
-            s_alias = st.text_input("전략 별칭 (Alias)", value=f"{m_code}_전략_1", key=f"{m_lower}_alias")
+            s_alias = st.text_input("전략 별칭 (Alias)", value=f"{m_code}_전략_1", key=f"{t_mode}_{m_lower}_{s_choice.lower()}_alias")
         else:
             s_alias = selected_alias_opt
             st.info(f"선택됨: **{s_alias}**")
+            
+        widget_suffix = f"{s_symbol}_{s_alias}"
         
         # DB에서 기존 설정 로드
-        d_state = load_state_db(s_symbol, s_choice, market=m_code, strategy_name=s_alias) if s_mode == "실전 투자" and s_symbol else None
+        d_state = load_state_db(s_symbol, s_choice, market=m_code, strategy_name=s_alias) if internal_mode == "실전 투자" and s_symbol else None
 
         # --- [통합] 백테스트 전용 설정 ---
         f_days, f_rate, t_rate = 300, 0.0007, 0.0
-        if s_mode == "백테스트":
+        if internal_mode == "백테스트":
             col_bt1, col_bt2 = st.columns(2)
             f_days = col_bt1.number_input("데이터 기간 (일)", value=300, min_value=30, key=f"{m_lower}_{widget_suffix}_bt_days")
             
@@ -689,7 +771,7 @@ with st.sidebar:
             q_stop = st.checkbox("쿼터 손절 사용", value=def_qs, key=f"{m_lower}_{widget_suffix}_ca_qs")
             
             return {
-                "mode": s_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": s_pool, "version": s_ver,
+                "mode": internal_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": s_pool, "version": s_ver,
                 "unit_buy": u_buy, "target_profit": t_profit, "a_default": a_val, "use_quarter_stop": q_stop,
                 "initial_cash": s_pool, "fetch_days": f_days, "fee_rate": f_rate, "tax_rate": t_rate
             }
@@ -715,14 +797,14 @@ with st.sidebar:
             v_freq = st.selectbox("주기", ["매주 금요일", "격주 금요일 (2주)", "4주마다 금요일"], index=1, key=f"{m_lower}_{widget_suffix}_vr_freq")
             
             return {
-                "mode": s_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": def_pool,
+                "mode": internal_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": def_pool,
                 "g_value": g_val, "band_pct": b_pct, "periodic_amt": p_amt,
                 "initial_cash": i_cash, "investment_type": v_type, "freq": v_freq, "invest_type_disp": v_type_disp,
                 "fetch_days": f_days, "fee_rate": f_rate, "tax_rate": t_rate
             }
 
     # [수정] 사이드바 탭을 제거하고 활성 시장에 맞는 설정만 렌더링하여 UI 혼선 방지
-    active_settings = render_strategy_settings(active_market_code)
+    active_settings = render_strategy_settings(active_market_code, s_choice, s_mode)
     
     market_code = active_market_code
     mode = active_settings["mode"]
@@ -738,6 +820,21 @@ with st.sidebar:
     
     # [UI 상태 저장] 선택이 변경될 때마다 DB 업데이트
     save_ui_settings_db(st.session_state.user_email, active_market_display, symbol, strategy_alias)
+    
+    # [8구획 독립 UI 상태 저장]
+    if st.session_state.user_email:
+        import json
+        current_trade_mode_val = get_trade_mode()
+        save_key = f"ui_target_{st.session_state.user_email}_{current_trade_mode_val}_{strategy_choice}_{market_code}"
+        target_val = json.dumps({"symbol": symbol, "alias": strategy_alias})
+        set_config(save_key, target_val)
+        
+        # 각 시장 및 모드별 마지막 전략 타입(CA/VR) 저장
+        set_config(f"last_strategy_{st.session_state.user_email}_{current_trade_mode_val}_{market_code}", strategy_choice)
+        
+        # 세션 상태도 업데이트
+        target_key = f"target_{current_trade_mode_val.lower()}_{market_code.lower()}_{strategy_choice.lower()}"
+        st.session_state[target_key] = {"symbol": symbol, "alias": strategy_alias}
     initial_cash = active_settings["initial_cash"]
     fetch_days = active_settings.get("fetch_days", 300)
     fee_rate = active_settings.get("fee_rate", 0.0007)
@@ -905,19 +1002,104 @@ with st.sidebar:
 if st.sidebar.button("🔓 로그아웃"):
     handle_logout()
 
-st.title(f"🚀 {mode} - {strategy_choice} 전략")
+display_mode = "모의 투자" if (current_trade_mode == "MOCK" and mode == "실전 투자") else mode
+st.title(f"🚀 {display_mode} - {strategy_choice} 전략")
 
 # --- 시장별 현황 탭 --- (사이드바 선택에 따라 강조 및 필터링)
 # [수정] 활성 시장에 따라 탭 순서를 동적으로 변경하여 첫 번째 탭이 항상 활성 시장을 가리키도록 함
 if market_code == "KR":
-    tab_names = [f"🇰🇷 한국 주식 시장 현황 ✅", f"🇺🇸 미국 주식 시장 현황", "🏁 종료된 전략 내역", "📈 손익분석", "⚙️ 설정"]
-    tabs = st.tabs(tab_names)
+    tab_names = ["✅ 🇰🇷 한국 주식 시장 현황", "🇺🇸 미국 주식 시장 현황", "🏁 종료된 전략 내역", "📈 손익분석", "⚙️ 설정"]
+    tabs = st.tabs(tab_names, key=f"market_tabs_{get_trade_mode().lower()}_{market_code.lower()}")
     tab_kr, tab_us, tab_finished, tab_analysis, tab_settings = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
 else:
-    tab_names = [f"🇺🇸 미국 주식 시장 현황 ✅", f"🇰🇷 한국 주식 시장 현황", "🏁 종료된 전략 내역", "📈 손익분석", "⚙️ 설정"]
-    tabs = st.tabs(tab_names)
+    tab_names = ["✅ 🇺🇸 미국 주식 시장 현황", "🇰🇷 한국 주식 시장 현황", "🏁 종료된 전략 내역", "📈 손익분석", "⚙️ 설정"]
+    tabs = st.tabs(tab_names, key=f"market_tabs_{get_trade_mode().lower()}_{market_code.lower()}")
     tab_us, tab_kr, tab_finished, tab_analysis, tab_settings = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
 
+
+@st.fragment(run_every=5)
+def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy_alias, currency_symbol, ActiveBroker):
+    # 1. DB에서 가장 최신 상태 로드 (웹소켓 체결 업데이트가 실시간으로 반영됨)
+    state = load_state_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
+    is_new_strategy = False
+    if not state:
+        is_new_strategy = True
+        state = {
+            "pool": 0.0,
+            "total_shares": 0.0,
+            "avg_price": 0.0,
+            "current_price": 0.0,
+            "updated_at": "N/A"
+        }
+        # 만약 실시간 계좌 조회 데이터가 세션에 있으면 수량과 평단가를 그것으로 채워줌
+        if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
+            state['total_shares'] = st.session_state['live_account'].get('shares', 0.0)
+            state['avg_price'] = st.session_state['live_account'].get('avg_price', 0.0)
+            state['pool'] = st.session_state['live_account'].get('pool', 0.0)
+
+    # [STOP] 휴장 시간 브로커 호출 방지
+    is_active, _ = check_market_active(market_code)
+    
+    # 2. 실시간 시세 및 잔고 정보 계산
+    broker_cash = 0.0
+    if 'live_account' in st.session_state and 'broker_cash' in st.session_state['live_account']:
+        broker_cash = st.session_state['live_account']['broker_cash']
+    else:
+        try:
+            broker = ActiveBroker
+            broker_cash = broker.get_cash_pool()
+            if 'live_account' not in st.session_state:
+                st.session_state['live_account'] = {}
+            st.session_state['live_account']['broker_cash'] = broker_cash
+        except Exception as e:
+            broker_cash = state.get('pool', 0.0)
+
+    if is_active:
+        broker = ActiveBroker
+        curr_price = broker.get_price(symbol)
+        prev_close = broker.get_previous_close(symbol)
+    else:
+        curr_price = state.get('current_price', 0)
+        prev_close = curr_price # 정확한 전일종가 조회가 어려우므로 현재가로 대체 표시
+
+    # 수치 추출 (DB 기반 - 웹소켓 클라이언트가 업데이트한 값)
+    pool = state.get('pool', 0.0)
+    shares = state.get('total_shares', 0.0)
+    avg_price = state.get('avg_price', 0.0)
+    
+    # s_pool 계산: CA는 pool - (shares * avg_price), VR은 pool 그대로
+    if strategy_choice == "CA":
+        s_pool = pool - (shares * avg_price)
+    else:
+        s_pool = pool
+    
+    # 실시간 평가액 및 수익 계산
+    eval_amt = shares * curr_price
+    profit = eval_amt - (shares * avg_price)
+    profit_pct = (profit / (shares * avg_price) * 100) if (shares * avg_price) > 0 else 0
+    
+    price_diff = curr_price - prev_close
+    price_diff_pct = (price_diff / prev_close * 100) if prev_close > 0 else 0
+    diff_fmt = f"{int(price_diff):+,}" if market_code == "KR" else f"{price_diff:+.2f}"
+    delta_price = f"{diff_fmt} ({price_diff_pct:+.2f}%)"
+
+    st.divider()
+    if is_new_strategy:
+        st.info("💡 등록된 전략 상태가 없습니다. 기본 정보(시세, 예수금)를 기반으로 임시 상태가 표시되고 있습니다. 신규전략 저장 및 실행 시 DB에 저장됩니다.")
+    col_p1, col_p2 = st.columns(2)
+    col_p1.metric(label=f"💰 전략 할당 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(s_pool, market_code)}", help="설정된 전체 예수금에서 현재 투입액을 차감한 실시간 가용 예수금(s_pool)입니다.")
+    col_p2.metric(label=f"🏦 거래소 총 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(broker_cash, market_code)}", help="증권사 계좌의 실제 주문 가능 원금입니다. 계좌 상태 조회 시 갱신됩니다.")
+
+    st.subheader(f"보유 종목 현황: {format_ticker_display(symbol, market_code)}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    
+    c1.metric(label=f"현재가 ({currency_symbol})", value=f"{currency_symbol}{format_currency(curr_price, market_code)}", delta=delta_price)
+    c2.metric("보유 수량", f"{int(shares) if market_code == 'KR' else shares}주")
+    c3.metric("평단가", f"{currency_symbol}{format_currency(avg_price, market_code)}")
+    c4.metric("평가금액", f"{currency_symbol}{format_currency(eval_amt, market_code)}")
+    c5.metric("추정 평가손익", f"{currency_symbol}{format_currency(profit, market_code)}", delta=f"{profit_pct:+.2f}%")
+    
+    st.caption(f"⏱️ 웹소켓 및 DB 연동 중 (5초 주기 자동 갱신) | DB 최종 갱신: {state.get('updated_at', 'N/A')}")
 
 def render_market_tab(m_code):
     # 해당 시장의 종목 리스트 미리 로드 (명칭 표시용)
@@ -949,8 +1131,9 @@ def render_market_tab(m_code):
                 # [ADD] 전략 선택 버튼 (사이드바 연동)
                 if st.button("🎯 이 전략을 작업 대상으로 선택", key=f"sel_target_{m_code}_{stype}_{sym}_{disp_name}", width='stretch', type="primary"):
                     st.session_state["pending_market_selector_update"] = "미국 시장" if m_code == "US" else "한국 시장"
-                    st.session_state["pending_symbol_update"] = {"m_code": m_code, "symbol": sym}
-                    st.session_state["pending_alias_update"] = {"m_code": m_code, "alias": disp_name}
+                    st.session_state["pending_strat_update"] = {"m_code": m_code, "strat": stype}
+                    st.session_state["pending_symbol_update"] = {"m_code": m_code, "strat": stype, "symbol": sym}
+                    st.session_state["pending_alias_update"] = {"m_code": m_code, "strat": stype, "alias": disp_name}
                     st.session_state["last_loaded_symbol"] = sym
                     st.session_state["last_loaded_alias"] = disp_name
                     st.rerun()
@@ -1260,10 +1443,24 @@ with tab_settings:
     st.header("⚙️ 시스템 및 사용자 설정")
     
     with st.expander("👤 사용자 정보", expanded=True):
-        u_name = st.text_input("사용자 이름", value=get_config("user_name", "Investor"))
+        default_user_display = get_config("user_name")
+        if not default_user_display:
+            default_user_display = st.session_state.get("username", "Investor")
+        u_name = st.text_input("사용자 이름", value=default_user_display)
         if st.button("사용자 정보 저장"):
             set_config("user_name", u_name)
+            try:
+                import sqlite3
+                conn = sqlite3.connect(os.path.join(PROJECT_ROOT, "data", "cavr.db"))
+                cursor = conn.cursor()
+                cursor.execute("UPDATE user_auth SET username=? WHERE email=?", (u_name, st.session_state.user_email))
+                conn.commit()
+                conn.close()
+                st.session_state["username"] = u_name
+            except Exception as u_err:
+                logger.error(f"사용자 이름 업데이트 실패: {u_err}")
             st.success("사용자 정보가 저장되었습니다.")
+            st.rerun()
             
     with st.expander("📧 이메일 알림 설정 (SMTP)"):
         st.caption("시스템 중요 알림 및 일일 보고서를 수신할 Zoho SMTP 설정을 관리합니다.")
@@ -1558,79 +1755,8 @@ if mode == "실전 투자":
                 time.sleep(1)
                 st.rerun()
     
-    # --- [수정] 보유 종목 현황 실시간 업데이트를 위한 프래그먼트 도입 ---
-    @st.fragment(run_every=5)
-    def display_holdings_metrics_live():
-        # 1. DB에서 가장 최신 상태 로드 (웹소켓 체결 업데이트가 실시간으로 반영됨)
-        state = load_state_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
-        if not state:
-            st.info("💡 등록된 전략 상태가 없습니다. 먼저 '계좌 상태 조회' 버튼을 누르거나 전략을 저장해주세요.")
-            return
-
-        # [STOP] 휴장 시간 브로커 호출 방지
-        is_active, _ = check_market_active(market_code)
-        
-        # 2. 실시간 시세 및 잔고 정보 계산
-        broker_cash = 0.0
-        if 'live_account' in st.session_state and 'broker_cash' in st.session_state['live_account']:
-            broker_cash = st.session_state['live_account']['broker_cash']
-        else:
-            try:
-                broker = ActiveBroker
-                broker_cash = broker.get_cash_pool()
-                if 'live_account' not in st.session_state:
-                    st.session_state['live_account'] = {}
-                st.session_state['live_account']['broker_cash'] = broker_cash
-            except Exception as e:
-                broker_cash = state.get('pool', 0.0)
-
-        if is_active:
-            broker = ActiveBroker
-            curr_price = broker.get_price(symbol)
-            prev_close = broker.get_previous_close(symbol)
-        else:
-            curr_price = state.get('current_price', 0)
-            prev_close = curr_price # 정확한 전일종가 조회가 어려우므로 현재가로 대체 표시
-
-        # 수치 추출 (DB 기반 - 웹소켓 클라이언트가 업데이트한 값)
-        pool = state.get('pool', 0.0)
-        shares = state.get('total_shares', 0.0)
-        avg_price = state.get('avg_price', 0.0)
-        
-        # s_pool 계산: CA는 pool - (shares * avg_price), VR은 pool 그대로
-        if strategy_choice == "CA":
-            s_pool = pool - (shares * avg_price)
-        else:
-            s_pool = pool
-        
-        # 실시간 평가액 및 수익 계산
-        eval_amt = shares * curr_price
-        profit = eval_amt - (shares * avg_price)
-        profit_pct = (profit / (shares * avg_price) * 100) if (shares * avg_price) > 0 else 0
-        
-        price_diff = curr_price - prev_close
-        price_diff_pct = (price_diff / prev_close * 100) if prev_close > 0 else 0
-        diff_fmt = f"{int(price_diff):+,}" if market_code == "KR" else f"{price_diff:+.2f}"
-        delta_price = f"{diff_fmt} ({price_diff_pct:+.2f}%)"
-
-        st.divider()
-        col_p1, col_p2 = st.columns(2)
-        col_p1.metric(label=f"💰 전략 할당 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(s_pool, market_code)}", help="설정된 전체 예수금에서 현재 투입액을 차감한 실시간 가용 예수금(s_pool)입니다.")
-        col_p2.metric(label=f"🏦 거래소 총 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(broker_cash, market_code)}", help="증권사 계좌의 실제 주문 가능 원금입니다. 계좌 상태 조회 시 갱신됩니다.")
-
-        st.subheader(f"보유 종목 현황: {format_ticker_display(symbol, market_code)}")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        
-        c1.metric(label=f"현재가 ({currency_symbol})", value=f"{currency_symbol}{format_currency(curr_price, market_code)}", delta=delta_price)
-        c2.metric("보유 수량", f"{int(shares) if market_code == 'KR' else shares}주")
-        c3.metric("평단가", f"{currency_symbol}{format_currency(avg_price, market_code)}")
-        c4.metric("평가금액", f"{currency_symbol}{format_currency(eval_amt, market_code)}")
-        c5.metric("추정 평가손익", f"{currency_symbol}{format_currency(profit, market_code)}", delta=f"{profit_pct:+.2f}%")
-        
-        st.caption(f"⏱️ 웹소켓 및 DB 연동 중 (5초 주기 자동 갱신) | DB 최종 갱신: {state.get('updated_at', 'N/A')}")
-
-    # 프래그먼트 실행
-    display_holdings_metrics_live()
+    # --- [수정] 보유 종목 현황 실시간 업데이트를 위한 프래그먼트 호출 ---
+    display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy_alias, currency_symbol, ActiveBroker)
 
     # === [신규] 주문 내역 실시간 동기화 (Sync with Kiwoom) ===
     is_active, _ = check_market_active(market_code)
@@ -1772,12 +1898,13 @@ if mode == "실전 투자":
 
                 # [Live Data Overlay] 실시간 계좌 정보가 있다면 화면 표시용 변수를 최신화
                 # (DB 상태가 아직 업데이트되지 않았거나 초기화 상태일 경우를 대비)
-                if 'live_account' in st.session_state and st.session_state['live_account']['symbol'] == symbol:
+                if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
                     live_info = st.session_state['live_account']
-                    if live_info['shares'] > 0:
+                    live_shares_val = live_info.get('shares', 0.0)
+                    if live_shares_val > 0:
                         # 평단과 수량을 실시간 데이터로 대체하여 표시
-                        avg_price = live_info['avg_price']
-                        total_shares = live_info['shares']
+                        avg_price = live_info.get('avg_price', 0.0)
+                        total_shares = live_shares_val
                         
                         # T값이 0이거나 실제 잔고와 차이가 클 경우 재추정하여 표시
                         # T = (평단 * 수량) / 1회매수금
@@ -1971,11 +2098,11 @@ if mode == "실전 투자":
             # === 신규 진입 또는 재시작 (상태 데이터 없음) ===
             st.warning(f"'{symbol}'에 대한 진행 중인 CA 전략이 없습니다.")
             
-            if 'live_account' in st.session_state:
+            if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
                 # 계좌 정보 기반 T값 역산 및 초기화 제안
                 info = st.session_state['live_account']
-                current_shares = info['shares']
-                current_avg_price = info['avg_price']
+                current_shares = info.get('shares', 0.0)
+                current_avg_price = info.get('avg_price', 0.0)
                 
                 # 사용자 입력값(사이드바) 가져오기
                 input_unit_buy = unit_buy
@@ -2054,10 +2181,10 @@ if mode == "실전 투자":
                 # VRState에는 shares가 없고 Pool과 V만 관리됨. Shares는 실시간 잔고로 파악해야 함.
                 
                 # Live 정보가 있으면 그것을 우선 사용
-                if 'live_account' in st.session_state and st.session_state['live_account']['symbol'] == symbol:
-                    live_shares = st.session_state['live_account']['shares']
-                    live_pool = st.session_state['live_account']['pool']
-                    current_price = st.session_state['live_account']['current_price']
+                if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
+                    live_shares = st.session_state['live_account'].get('shares', 0.0)
+                    live_pool = st.session_state['live_account'].get('pool', last_pool)
+                    current_price = st.session_state['live_account'].get('current_price', 0.0)
                 else:
                     live_shares = 0
                     live_pool = last_pool
@@ -2242,9 +2369,9 @@ if mode == "실전 투자":
         else:
             # === 신규 진입 (VR) ===
             st.warning(f"'{symbol}'에 대한 진행 중인 VR 전략이 없습니다.")
-            if 'live_account' in st.session_state:
+            if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
                 info = st.session_state['live_account']
-                init_v = (info['shares'] * info['current_price']) + info['pool']
+                init_v = (info.get('shares', 0.0) * info.get('current_price', 0.0)) + info.get('pool', 0.0)
                 
                 st.info(f"현재 자산 기준으로 **초기 V값**을 설정합니다.")
                 st.write(f"- 총 평가 자산 (Equity + Pool): **{currency_symbol}{format_currency(init_v, market_code)}**")
@@ -2252,7 +2379,7 @@ if mode == "실전 투자":
                 if st.button("✅ VR 전략 초기화 및 시작 (DB 저장)", type="primary"):
                     from core.cavr import VRState
                     # 이미 주식을 보유중이라면 RUNNING 모드로 바로 시작
-                    mode = "RUNNING" if info['shares'] > 0 else "BOOTSTRAP"
+                    mode = "RUNNING" if info.get('shares', 0.0) > 0 else "BOOTSTRAP"
                     
                     new_state = VRState(
                         symbol=symbol,
@@ -2260,12 +2387,12 @@ if mode == "실전 투자":
                         strategy_name=strategy_alias,
                         market=market_code,
                         V=init_v,
-                        pool=info['pool'],
+                        pool=info.get('pool', 0.0),
                         last_E=init_v,
                         mode=mode,
                         bootstrap_day_count=0,
                         cycle_V=init_v,
-                        cycle_start_pool=info['pool']
+                        cycle_start_pool=info.get('pool', 0.0)
                     )
                     save_state_db(new_state, market=market_code, strategy_name=strategy_alias)
                     st.success(f"**{symbol}** VR 전략 ({mode}) 초기화 완료! 화면을 갱신합니다.")

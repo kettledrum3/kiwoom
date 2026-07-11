@@ -124,34 +124,35 @@ def init_db(run_maintenance=False):
     ''')
     
     # 전략 상태 저장 테이블 (JSON 형태로 상태 저장)
-    # Migration for strategy_state PRIMARY KEY change
+    # Migration for strategy_state PRIMARY KEY change to include trade_mode
     cursor.execute("PRAGMA table_info(strategy_state)")
     ss_cols_info = cursor.fetchall()
     
-    # Check if strategy_name is part of the primary key
-    pk_cols = [col[1] for col in ss_cols_info if col[5] > 0] # col[5] is pk
-    
-    if ss_cols_info and ('strategy_name' not in pk_cols or len(pk_cols) != 4): # If PK is not (symbol, strategy, market, strategy_name)
-        logger.info("🛠️ [Migration] strategy_state 테이블의 PRIMARY KEY를 (symbol, strategy, market, strategy_name)으로 변경합니다.")
-        # 1. 기존 테이블 이름 변경
-        cursor.execute("ALTER TABLE strategy_state RENAME TO strategy_state_old;")
-        # 2. 새 테이블 생성 (새로운 PRIMARY KEY 포함)
-        cursor.execute('''
-            CREATE TABLE strategy_state (
-                symbol TEXT,
-                strategy TEXT,
-                market TEXT DEFAULT 'US',
-                strategy_name TEXT,
-                state_json TEXT,
-                is_active INTEGER DEFAULT 1,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (symbol, strategy, market, strategy_name)
-            )
-        ''')
-        # 3. 기존 데이터 복사 (strategy_name이 NULL인 경우 빈 문자열로 처리)
-        cursor.execute("INSERT INTO strategy_state (symbol, strategy, market, strategy_name, state_json, updated_at) SELECT symbol, strategy, market, COALESCE(strategy_name, ''), state_json, updated_at FROM strategy_state_old;")
-        # 4. 이전 테이블 삭제
-        cursor.execute("DROP TABLE strategy_state_old;")
+    if ss_cols_info:
+        pk_cols = [col[1] for col in ss_cols_info if col[5] > 0] # col[5] is pk
+        col_names = [col[1] for col in ss_cols_info]
+        if 'trade_mode' not in pk_cols or len(pk_cols) != 5:
+            logger.info("🛠️ [Migration] strategy_state 테이블의 PRIMARY KEY를 (symbol, strategy, market, strategy_name, trade_mode)으로 변경합니다.")
+            cursor.execute("ALTER TABLE strategy_state RENAME TO strategy_state_old;")
+            cursor.execute('''
+                CREATE TABLE strategy_state (
+                    symbol TEXT,
+                    strategy TEXT,
+                    market TEXT DEFAULT 'US',
+                    strategy_name TEXT,
+                    trade_mode TEXT DEFAULT 'REAL',
+                    is_active INTEGER DEFAULT 1,
+                    state_json TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (symbol, strategy, market, strategy_name, trade_mode)
+                )
+            ''')
+            is_active_part = "is_active" if "is_active" in col_names else "1"
+            cursor.execute(f"""
+                INSERT INTO strategy_state (symbol, strategy, market, strategy_name, trade_mode, is_active, state_json, updated_at)
+                SELECT symbol, strategy, market, strategy_name, 'REAL', {is_active_part}, state_json, updated_at FROM strategy_state_old;
+            """)
+            cursor.execute("DROP TABLE strategy_state_old;")
     else:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS strategy_state (
@@ -159,10 +160,11 @@ def init_db(run_maintenance=False):
                 strategy TEXT,
                 market TEXT DEFAULT 'US',
                 strategy_name TEXT,
+                trade_mode TEXT DEFAULT 'REAL',
                 is_active INTEGER DEFAULT 1,
                 state_json TEXT,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (symbol, strategy, market, strategy_name)
+                PRIMARY KEY (symbol, strategy, market, strategy_name, trade_mode)
             )
         ''')
     
@@ -173,10 +175,17 @@ def init_db(run_maintenance=False):
             strategy TEXT,
             market TEXT,
             strategy_name TEXT,
+            trade_mode TEXT DEFAULT 'REAL',
             state_json TEXT,
             finished_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Add trade_mode column to finished_strategy_state if not exists
+    cursor.execute("PRAGMA table_info(finished_strategy_state)")
+    fss_cols = [col[1] for col in cursor.fetchall()]
+    if "trade_mode" not in fss_cols:
+        cursor.execute("ALTER TABLE finished_strategy_state ADD COLUMN trade_mode TEXT DEFAULT 'REAL'")
 
     # 사용자 인증 테이블 추가
     cursor.execute('''
@@ -362,12 +371,15 @@ def get_next_strategy_name(symbol, strategy_type, market):
         
     return f"{base_prefix}_{max_n + 1}차"
 
-def save_state_db(state, market: str = "US", strategy_name: str = "", only_if_exists: bool = False):
+def save_state_db(state, market: str = "US", strategy_name: str = "", only_if_exists: bool = False, trade_mode: str = None):
     """
     전략 상태를 DB에 저장.
     only_if_exists=True인 경우, 기존에 해당 전략이 DB에 있을 때만 업데이트합니다. (유령 전략 생성 방지)
     """
     try:
+        if trade_mode is None:
+            trade_mode = get_trade_mode()
+            
         conn = get_connection()
         cursor = conn.cursor()
         
@@ -375,8 +387,8 @@ def save_state_db(state, market: str = "US", strategy_name: str = "", only_if_ex
         if only_if_exists:
             cursor.execute('''
                 SELECT 1 FROM strategy_state 
-                WHERE symbol=? AND strategy=? AND market=? AND strategy_name=?
-            ''', (state.symbol, state.strategy_type, market, strategy_name))
+                WHERE symbol=? AND strategy=? AND market=? AND strategy_name=? AND trade_mode=?
+            ''', (state.symbol, state.strategy_type, market, strategy_name, trade_mode))
             if not cursor.fetchone():
                 logger.debug(f"⚠️ [DB] 존재하지 않는 전략({state.symbol}-{strategy_name})의 저장을 건너뜁니다.")
                 conn.close()
@@ -388,23 +400,26 @@ def save_state_db(state, market: str = "US", strategy_name: str = "", only_if_ex
         json_str = json.dumps(state_dict, ensure_ascii=False)
         
         cursor.execute('''
-            INSERT OR REPLACE INTO strategy_state (symbol, strategy, market, strategy_name, state_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (state.symbol, state.strategy_type, market, strategy_name, json_str))
+            INSERT OR REPLACE INTO strategy_state (symbol, strategy, market, strategy_name, trade_mode, state_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (state.symbol, state.strategy_type, market, strategy_name, trade_mode, json_str))
         
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"Failed to save state to DB: {e}")
 
-def load_state_db(symbol, strategy_type, market: str = "US", strategy_name: str = ""):
+def load_state_db(symbol, strategy_type, market: str = "US", strategy_name: str = "", trade_mode: str = None):
     """DB에서 전략 상태 로드"""
     try:
+        if trade_mode is None:
+            trade_mode = get_trade_mode()
+            
         conn = get_connection()
         cursor = conn.cursor()
 
-        query = 'SELECT state_json, strategy_name FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND strategy=? AND market=?'
-        params = [symbol, f"{symbol} %", strategy_type, market]
+        query = 'SELECT state_json, strategy_name FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND strategy=? AND market=? AND trade_mode=?'
+        params = [symbol, f"{symbol} %", strategy_type, market, trade_mode]
 
         if strategy_name:
             query += ' AND strategy_name=?'
@@ -424,25 +439,28 @@ def load_state_db(symbol, strategy_type, market: str = "US", strategy_name: str 
         logger.error(f"Failed to load state from DB: {e}")
         return None
 
-def finish_strategy_db(symbol, strategy, market: str = "US", strategy_name: str = ""):
+def finish_strategy_db(symbol, strategy, market: str = "US", strategy_name: str = "", trade_mode: str = None):
     """전략을 종료 상태로 이동 (history 관리)"""
     try:
+        if trade_mode is None:
+            trade_mode = get_trade_mode()
+            
         conn = get_connection()
         cursor = conn.cursor()
         
         # 1. 기존 상태 복사하여 finished 테이블에 삽입
         cursor.execute('''
-            INSERT INTO finished_strategy_state (symbol, strategy, market, strategy_name, state_json, finished_at)
-            SELECT symbol, strategy, market, strategy_name, state_json, CURRENT_TIMESTAMP
+            INSERT INTO finished_strategy_state (symbol, strategy, market, strategy_name, trade_mode, state_json, finished_at)
+            SELECT symbol, strategy, market, strategy_name, trade_mode, state_json, CURRENT_TIMESTAMP
             FROM strategy_state
-            WHERE symbol=? AND strategy=? AND market=? AND strategy_name=?
-        ''', (symbol, strategy, market, strategy_name))
+            WHERE symbol=? AND strategy=? AND market=? AND strategy_name=? AND trade_mode=?
+        ''', (symbol, strategy, market, strategy_name, trade_mode))
         
         # 2. 기존 활성 전략 테이블에서 삭제
         cursor.execute('''
             DELETE FROM strategy_state 
-            WHERE symbol=? AND strategy=? AND market=? AND strategy_name=?
-        ''', (symbol, strategy, market, strategy_name))
+            WHERE symbol=? AND strategy=? AND market=? AND strategy_name=? AND trade_mode=?
+        ''', (symbol, strategy, market, strategy_name, trade_mode))
         
         conn.commit()
         conn.close()
@@ -450,12 +468,15 @@ def finish_strategy_db(symbol, strategy, market: str = "US", strategy_name: str 
     except Exception as e:
         logger.error(f"Failed to finish strategy: {e}")
 
-def get_finished_states_db():
+def get_finished_states_db(trade_mode: str = None):
     """종료된 모든 전략 상태 조회"""
     try:
+        if trade_mode is None:
+            trade_mode = get_trade_mode()
+            
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT symbol, strategy, market, strategy_name, state_json, finished_at FROM finished_strategy_state ORDER BY finished_at DESC')
+        cursor.execute('SELECT symbol, strategy, market, strategy_name, state_json, finished_at FROM finished_strategy_state WHERE trade_mode=? ORDER BY finished_at DESC', (trade_mode,))
         rows = cursor.fetchall()
         conn.close()
         return rows
@@ -463,14 +484,21 @@ def get_finished_states_db():
         logger.error(f"Failed to load finished states: {e}")
         return []
 
-def get_all_states_db(strategy_type=None, market=None, strategy_name=None, symbol=None):
+def get_all_states_db(strategy_type=None, market=None, strategy_name=None, symbol=None, trade_mode: str = None):
     """저장된 모든 전략 상태 조회"""
     try:
+        if trade_mode is None:
+            trade_mode = get_trade_mode()
+            
         conn = get_connection()
         cursor = conn.cursor()
         query = 'SELECT state_json, strategy_name, market, updated_at FROM strategy_state'
         params = []
         conditions = []
+        
+        conditions.append('trade_mode=?')
+        params.append(trade_mode)
+        
         if strategy_type:
             conditions.append('strategy=?')
             params.append(strategy_type)
@@ -1486,6 +1514,70 @@ def get_trade_mode() -> str:
         pass
             
     return os.getenv("TRADE_MODE", "REAL")
+
+def get_holdings_from_db(symbol, market, strategy_name):
+    """
+    DB의 거래 내역(trade_history) 및 전략 상태(strategy_state)를 기준으로 현재 보유 수량과 평단가를 조회합니다.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # 1. 먼저 strategy_state 테이블 확인
+        cursor.execute(
+            "SELECT state_json, strategy FROM strategy_state WHERE symbol=? AND market=? AND strategy_name=?",
+            (symbol, market, strategy_name)
+        )
+        row = cursor.fetchone()
+        
+        shares = 0.0
+        avg_price = 0.0
+        
+        if row:
+            state_json, strategy_type = row
+            try:
+                state_data = json.loads(state_json)
+                if strategy_type == "CA":
+                    shares = float(state_data.get("total_shares", 0.0))
+                    avg_price = float(state_data.get("avg_price", 0.0))
+                    conn.close()
+                    return shares, avg_price, 0.0
+            except Exception as e:
+                logger.error(f"Error parsing state_json in get_holdings_from_db: {e}")
+                
+        # 2. CA가 아니거나 state_json에 정보가 없으면 trade_history에서 계산
+        # 특정 별칭(strategy_name)의 매수 총량 - 매도 총량 계산
+        cursor.execute(
+            """
+            SELECT 
+                SUM(CASE WHEN side='BUY' THEN qty ELSE -qty END) as net_qty
+            FROM trade_history 
+            WHERE symbol=? AND market=? AND strategy_name=?
+            """,
+            (symbol, market, strategy_name)
+        )
+        qty_row = cursor.fetchone()
+        if qty_row and qty_row[0] is not None:
+            shares = max(0.0, float(qty_row[0]))
+            
+        # 평단가도 trade_history의 마지막 기록에서 가져옴
+        cursor.execute(
+            """
+            SELECT avg_price FROM trade_history 
+            WHERE symbol=? AND market=? AND strategy_name=? AND avg_price > 0
+            ORDER BY date DESC, id DESC LIMIT 1
+            """,
+            (symbol, market, strategy_name)
+        )
+        avg_row = cursor.fetchone()
+        if avg_row:
+            avg_price = float(avg_row[0])
+            
+        conn.close()
+        return shares, avg_price, 0.0
+    except Exception as e:
+        logger.error(f"Error in get_holdings_from_db: {e}")
+        return 0.0, 0.0, 0.0
 
 if __name__ == "__main__":
     init_db()

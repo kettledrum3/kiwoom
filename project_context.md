@@ -262,3 +262,12 @@
 *   **향후 작업 계획**:
     - 다가오는 주말에 모의투자 백테스트 모드를 통해 최종 시스템 안정성과 시나리오를 점검 및 모니터링할 예정.
     - 모의 검증 완료 이후, 기존 한국투자증권(KIS) 레거시 프로그램을 완전히 종료(Shutdown)하고 키움증권 단일 엔진으로 전면 이관 및 가동 개시할 계획.
+*   **Poetry 의존성 관리 및 패키징 모드 최적화**:
+    - `requirements.txt` 의존성을 `pyproject.toml`에 동기화 완료 (`websockets`, `pycryptodome`, `matplotlib`, `urllib3`, `tabulate` 추가).
+    - `poetry install` 시 로컬 폴더 패키지 미검출 에러 해결을 위해 `pyproject.toml` 하단에 `[tool.poetry] package-mode = false` 설정을 주입함.
+*   **Docker 이미지 빌드 & Portainer 배포 설계**:
+    - WSL Ubuntu 환경에서 `poetry.lock` 락킹 및 export 플러그인(`poetry-plugin-export`)을 활용하여 `requirements.txt`를 동기화하고 Docker 이미지를 빌드 및 Docker Hub(`simji3/kiwoom-*`)에 업로드하는 워크플로우 가이드라인([wsl_docker_build_guide.md](file:///C:/Users/simji/.gemini/antigravity-ide/brain/cc813e4e-d8f7-4d6f-8134-1320b387b362/wsl_docker_build_guide.md)) 정립.
+    - OCI 가상머신의 Portainer Web Editor(Stack) 환경에서 Docker Compose YAML 스택 코드를 붙여넣기 하여 손쉽게 원클릭 배포가 가능하도록 환경 구성 및 볼륨 구조 정의.
+*   **Git & GitHub 버전 관리 및 보안 연동**:
+    - 로컬 Git 저장소 초기화 및 GitHub 원격 저장소(`kiwoom`) 연동 절차 가이드라인([git_github_usage_guide.md](file:///C:/Users/simji/.gemini/antigravity-ide/brain/cc813e4e-d8f7-4d6f-8134-1320b387b362/git_github_usage_guide.md)) 작성.
+    - 소스 코드 푸시 전 `.gitignore` 설정을 정밀 점검하여 `env/` 디렉토리, `.env` 환경 변수 파일, `data/` 내부 SQLite DB 파일 등 민감한 계좌 정보 및 보안 데이터가 원격지에 절대 업로드되지 않도록 사전 차단 완료.

@@ -55,7 +55,7 @@ def register_user(username, email):
         conn.commit()
         
         subject = "[키움CAVR] 회원가입을 위한 임시 비밀번호입니다."
-        content = f"<h3>임시 비밀번호: <b style='color:blue;'>{otp}</b></h3><p>로그인 후 즉시 비밀번호를 변경해주세요.</p>"
+        content = f"<h3>안녕하세요, <b>{username}</b>님.</h3><p>귀하의 키움CAVR 자동매매 시스템 계정의 회원가입을 위한 임시 비밀번호는 아래와 같습니다.</p><h3>임시 비밀번호: <b style='color:blue;'>{otp}</b></h3><p>로그인 후 즉시 비밀번호를 변경해주세요.</p>"
         send_email(subject, content)
         return True
     except Exception as e:
@@ -98,9 +98,11 @@ def reset_password_request(email):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT username FROM user_auth WHERE email=?', (email,))
-    if not cursor.fetchone():
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         return False
+    username = row[0]
     
     otp = str(random.randint(100000, 999999))
     pw_hash = hash_password(otp)
@@ -109,7 +111,7 @@ def reset_password_request(email):
     conn.close()
     
     subject = "[키움CAVR] 비밀번호 재설정을 위한 임시 비밀번호입니다."
-    content = f"<h3>임시 비밀번호: <b style='color:red;'>{otp}</b></h3><p>보안을 위해 로그인 후 바로 변경해주세요.</p>"
+    content = f"<h3>안녕하세요, <b>{username}</b>님.</h3><p>귀하의 키움CAVR 자동매매 시스템 계정의 비밀번호 재설정을 위한 임시 비밀번호는 아래와 같습니다.</p><h3>임시 비밀번호: <b style='color:red;'>{otp}</b></h3><p>보안을 위해 로그인 후 바로 변경해주세요.</p>"
     return send_email(subject, content)
 
 def update_password(email, new_password):
@@ -122,6 +124,11 @@ def update_password(email, new_password):
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        # Fetch username to include in the email
+        cursor.execute('SELECT username FROM user_auth WHERE email=?', (email,))
+        row = cursor.fetchone()
+        username = row[0] if row else "고객"
+
         new_hash = hash_password(new_password)
         cursor.execute('UPDATE user_auth SET password_hash=?, is_temp_password=0 WHERE email=?', (new_hash, email))
         conn.commit()
@@ -131,7 +138,7 @@ def update_password(email, new_password):
         content = f"""
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
             <h2 style="color: #2e6c80;">🔐 비밀번호 변경 완료</h2>
-            <p>안녕하세요,</p>
+            <p>안녕하세요, <b>{username}</b>님.</p>
             <p>귀하의 <b>키움CAVR 자동매매 시스템</b> 계정({email})의 비밀번호가 성공적으로 변경되었습니다.</p>
             <p style="background-color: #f9f9f9; padding: 15px; border-left: 5px solid #2e6c80;">
                 <b>변경 일시:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (KST)

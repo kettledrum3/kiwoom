@@ -142,10 +142,7 @@ def run_ca_strategies(market: str = "US", check_existing: bool = False, force: b
     if not force and get_config("scheduler_status") != "running":
         logger.info(f"⏸️ [CA-{market}] 스케줄러가 정지 상태이므로 작업을 건너뜁니다.")
         return
-    # 2. CA 전략 활성화 여부 체크
-    if get_config("enable_ca") != "true":
-        logger.info(f"⏸️ [CA-{market}] CA 전략이 비활성화되어 있어 건너뜁니다.")
-        return
+
 
     logger.info(f"--- [CA-{market}] 전략 자동 실행 시작 ---")
     ca_states = get_all_states_db("CA", market=market)
@@ -198,10 +195,7 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
     if not force and get_config("scheduler_status") != "running":
         logger.info(f"⏸️ [VR-{market}] 스케줄러가 정지 상태이므로 작업을 건너뜁니다.")
         return
-    # 2. VR 전략 활성화 여부 체크
-    if get_config("enable_vr") != "true":
-        logger.info(f"⏸️ [VR-{market}] VR 전략이 비활성화되어 있어 건너뜁니다.")
-        return
+
 
     logger.info(f"--- [VR-{market}] 전략 자동 주문 시작 ---")
     vr_states = get_all_states_db("VR", market=market)
@@ -386,8 +380,6 @@ def job_market_open(market: str = "US"):
             sync_trade_history_db(st['symbol'], execs, strategy=st.get('strategy_type'), market=market, strategy_name=st.get('strategy_name'), silent=True)
         forbidden_error_tracker[market] = 0 # 성공 시 초기화
 
-        is_auto = get_config("planning_mode") == "auto"
-        
         # 한국 시장의 경우 장 시작 전에는 지정가(LIMIT) 매도 주문만 제출
         if market == "KR":
             run_ca_strategies(market=market, check_existing=True, order_filter="SELL_LIMIT_ONLY", broker=broker)
@@ -396,10 +388,7 @@ def job_market_open(market: str = "US"):
             
         run_vr_strategies(market=market, check_existing=True, broker=broker)
         
-        if is_auto:
-            logger.info(f"[{market}] 자동 주문 모드: 주문이 정상적으로 제출되었습니다.")
-        else:
-            logger.info(f"[{market}] 수동 주문 모드: 대시보드에서 계획 확인 후 승인이 필요합니다.")
+        logger.info(f"[{market}] 주문이 정상적으로 제출되었습니다.")
             
         logger.info(f"[{market}] 오늘의 투자 사이클 점검을 완료했습니다.")
     except Exception as e:
@@ -565,7 +554,7 @@ def job_check_shutdown():
 
 def job_intraday_check(market: str = "US"):
     """장중 주기적 감시 작업"""
-    if get_config("scheduler_status") == "running" and get_config("enable_ca") == "true":
+    if get_config("scheduler_status") == "running":
         logger.info(f"🔍 [Intraday-{market}] 장중 급락 감시를 시작합니다.")
         ca_states = get_all_states_db("CA", market=market)
         if not ca_states: return
@@ -708,10 +697,6 @@ def main():
     # --- 초기 설정 (설정이 없는 경우에만 초기화) ---
     if get_config("scheduler_status") is None:
         set_config("scheduler_status", "stopped")
-        set_config("enable_ca", "true")
-        set_config("enable_vr", "false")
-        # 주문 모드 초기화: manual(수동 확인), auto(자동 주문)
-        set_config("planning_mode", "manual")
         logger.info("🛑 스케줄러 초기 설정을 'stopped'로 완료했습니다.")
     
     # [설정] 작업 지연 경고 억제를 위해 유예 시간을 30초로 설정

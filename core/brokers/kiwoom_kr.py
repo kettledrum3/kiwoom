@@ -204,25 +204,28 @@ class KiwoomKrBroker(Broker):
             logger.error(f"[KR] 5일 평균가 파싱 오류: {e}")
         return 0.0
 
-    def get_account_equity(self, symbol: str) -> Optional[Tuple[float, float, float]]:
+    def get_account_equity(self, symbol: str) -> Tuple[float, float, float]:
         url = f"{self.base_url}/api/dostk/acnt"
         body = {
             "qry_tp": "0",
             "dmst_stex_tp": "KRX"
         }
-        res = self._call_api("POST", url, "kt00004", data=json.dumps(body))
-        if not res:
-            return None
-        data = res.json()
-        if data.get('return_code') != 0:
-            logger.error(f"[KR] 잔고 조회 실패: {data.get('return_msg')}")
-            return None
-            
-        for item in data.get('stk_acnt_evlt_prst', []):
-            item_cd = item.get('stk_cd', '').strip()
-            # 접두사 A 등 제거 후 비교
-            if item_cd.endswith(symbol.strip()):
-                return float(item.get('rmnd_qty', 0)), float(item.get('avg_prc', 0)), float(item.get('evlt_amt', 0))
+        try:
+            res = self._call_api("POST", url, "kt00004", data=json.dumps(body))
+            if not res:
+                return 0.0, 0.0, 0.0
+            data = res.json()
+            if data.get('return_code') != 0:
+                logger.error(f"[KR] 잔고 조회 실패: {data.get('return_msg')}")
+                return 0.0, 0.0, 0.0
+                
+            for item in data.get('stk_acnt_evlt_prst', []):
+                item_cd = item.get('stk_cd', '').strip()
+                # 접두사 A 등 제거 후 비교
+                if item_cd.endswith(symbol.strip()):
+                    return float(item.get('rmnd_qty', 0)), float(item.get('avg_prc', 0)), float(item.get('evlt_amt', 0))
+        except Exception as e:
+            logger.error(f"[KR] 잔고 조회 중 오류 발생: {e}")
         return 0.0, 0.0, 0.0
 
     def get_cumulative_buy_amount(self, symbol: str) -> float:
