@@ -271,3 +271,21 @@
 *   **Git & GitHub 버전 관리 및 보안 연동**:
     - 로컬 Git 저장소 초기화 및 GitHub 원격 저장소(`kiwoom`) 연동 절차 가이드라인([git_github_usage_guide.md](file:///C:/Users/simji/.gemini/antigravity-ide/brain/cc813e4e-d8f7-4d6f-8134-1320b387b362/git_github_usage_guide.md)) 작성.
     - 소스 코드 푸시 전 `.gitignore` 설정을 정밀 점검하여 `env/` 디렉토리, `.env` 환경 변수 파일, `data/` 내부 SQLite DB 파일 등 민감한 계좌 정보 및 보안 데이터가 원격지에 절대 업로드되지 않도록 사전 차단 완료.
+
+### 📅 2026-07-12 (대시보드 UI 대대적 보완, KeyError 차단 및 동기화 완비)
+*   **사이드바 2x2 라디오 버튼 제어판 통합**:
+    - 기존 드롭다운식 선택창들과 분산 배치된 전략 제어 체크박스들을 하나의 깔끔한 테두리가 있는 표 형태(`st.container(border=True)`)의 2x2 라디오 버튼 그리드로 개편.
+    - **1행**: 운영 모드(실전 투자 / 모의 투자) & 활성 시장(미국 시장 / 한국 시장)
+    - **2행**: 방법론(CA / VR) & 실행 모드(투자 실행 / 백테스트)
+    - 수동/자동 구분용 주문 모드(manual/auto) 및 글로벌 자동매매 스위치 체크박스는 자동화 완성에 따라 불필요하므로 완전히 제거하여 UI 간소화 완료.
+*   **대시보드 헤더 및 탭의 모의/실전 동기화 완비**:
+    - 사이드바 운영 모드(실전/모의)가 변경되면 메인 대시보드 헤더의 타이틀(`st.title`)에 실시간으로 **`🚀 모의 투자 - CA/VR 전략`** 또는 **`🚀 실전 투자 - CA/VR 전략`**으로 동기화되어 출력되도록 타이틀 포맷팅 조건문 복원.
+    - 미국/한국 시장 현황 탭을 동시에 모두 노출하되, 현재 활성화된 시장의 탭 명칭 앞에 체크마크 아이콘(`✅`)을 붙이고 **항상 첫 번째 탭(index 0)으로 순서를 동적으로 스왑**하도록 탭 렌더링 공식 보완. `st.tabs`에 유니크한 `key`를 매핑하여 시장/모드 전환 시 인덱스가 고정되어 화면이 멈추던 Streamlit 프레임워크 한계 해결.
+*   **신규 전략 진입 시 `KeyError: 'shares'` 예방 조치**:
+    - DB에 기존 정보가 없거나 캐싱된 `live_account` 데이터의 세션 껍데기(예: `broker_cash`만 들고 있고 종목은 없는 상태)만 있을 때 발생하던 `KeyError: 'shares'` 예외 해결.
+    - `st.session_state['live_account'].get('symbol') == symbol`을 검사해 현재 종목 정보가 존재할 때만 계좌 연동을 수행하도록 방어 가드를 세우고 모든 딕셔너리 접근을 안전한 `.get()` 메서드로 전환.
+*   **설정 탭 내 사용자 정보 매핑 및 DB 동기화**:
+    - 설정 탭의 사용자명 기본값으로 하드코딩된 `"Investor"` 대신 실제 로그인 세션에 활성화된 사용자 이름(`st.session_state.username`, 예: `"kiwoomcavr"`)이 디폴트값으로 나타나도록 매핑.
+    - 사용자명 수정 저장 시 `system_config` 뿐만 아니라 `user_auth` DB 테이블의 실제 사용자 레코드까지 동기화되어 업데이트되도록 구현.
+*   **Portainer Stack 배포 가이드라인 보완**:
+    - OCI 서버 터미널 CLI 방식 대신 웹 브라우저에서 Portainer Stack Editor를 열고 **"Re-pull image"** 옵션을 켜서 스택을 업데이트 및 재부팅하는 편리한 OCI 컨테이너 동기화 워크플로우를 정리 및 안내서([walkthrough.md](file:///C:/Users/simji/.gemini/antigravity-ide/brain/99e59c79-175c-4d89-9b23-ec3a00b2b1fb/walkthrough.md))에 등재.
