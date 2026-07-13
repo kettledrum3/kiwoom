@@ -316,12 +316,19 @@ def get_market_tickers(m_code):
 
 def check_market_active(m_code):
     """시장별 운영 시간 및 주말 여부 체크"""
+    trade_mode = get_trade_mode()
     if m_code == "KR":
         tz = pytz.timezone('Asia/Seoul')
-        open_time, close_time = dtime(7, 20), dtime(16, 40)
+        if trade_mode == "MOCK":
+            open_time, close_time = dtime(9, 0), dtime(15, 30)
+        else:
+            open_time, close_time = dtime(7, 20), dtime(16, 40)
     else:
         tz = pytz.timezone('America/New_York')
-        open_time, close_time = dtime(7, 0), dtime(18, 0) # [수정] US 시장 활성화 시간 조정 (07:00 ET ~ 18:00 ET)
+        if trade_mode == "MOCK":
+            open_time, close_time = dtime(9, 30), dtime(16, 0)
+        else:
+            open_time, close_time = dtime(7, 0), dtime(18, 0) # [수정] US 시장 활성화 시간 조정 (07:00 ET ~ 18:00 ET)
     
     now = datetime.now(tz)
     if now.weekday() >= 5: # 토, 일

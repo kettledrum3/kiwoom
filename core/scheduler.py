@@ -61,7 +61,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, "env", ".env"))
 
 from core.database import sync_trade_history_db, sync_open_orders_db
-from core.database import get_all_states_db, init_db, get_config, set_config
+from core.database import get_all_states_db, init_db, get_config, set_config, get_trade_mode
 from core.cavr import CAConfig, CostAveragingEngine, VRConfig, ValueRebalancingEngine, fetch_kr_holiday, fetch_us_holiday
 from core.brokers.kiwoom_us import KiwoomUsBroker
 from core.brokers.kiwoom_kr import KiwoomKrBroker
@@ -243,6 +243,7 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
 
 def is_market_active_for_orders(market: str) -> bool:
     """주문 제출이 가능한 시장 운영 시간인지 확인 (정규장 + 프리/애프터 마켓)"""
+    trade_mode = get_trade_mode()
     if market == "KR":
         tz = timezone('Asia/Seoul')
         # 한국 시장은 정규장 시간만 주문 가능 (09:00 ~ 15:30)
@@ -250,7 +251,11 @@ def is_market_active_for_orders(market: str) -> bool:
     else: # US Market
         tz = timezone('America/New_York')
         # 미국 시장은 실질적인 프리마켓 활성화부터 정규장 종료 후 1분까지 (07:00 ~ 16:01 ET)
-        open_time, close_time = dtime(7, 0), dtime(16, 1, 0)
+        if trade_mode == "MOCK":
+            # 모의계좌의 경우 미국 정규시간 제한 (09:30 ~ 16:01)
+            open_time, close_time = dtime(9, 30), dtime(16, 1, 0)
+        else:
+            open_time, close_time = dtime(7, 0), dtime(16, 1, 0)
 
     now = datetime.now(tz)
     if now.weekday() >= 5: # 토, 일
@@ -413,6 +418,10 @@ def job_kr_market_late_open():
 
 def job_us_pre_market_limit_sells():
     """미국 시장 프리마켓 시작 시 지정가 매도 주문 제출"""
+    if get_trade_mode() == "MOCK":
+        logger.info("⏸️ [US-PreMarket] 모의계좌는 정규시간만 운영하므로 프리마켓 주문을 진행하지 않습니다.")
+        return
+
     market = "US"
     if get_config("scheduler_status") != "running":
         logger.info(f"⏸️ [US-PreMarket] 스케줄러가 정지 상태입니다.")

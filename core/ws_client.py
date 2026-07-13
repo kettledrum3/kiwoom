@@ -55,9 +55,9 @@ class KisWebSocketClient:
 
         # 3. 거래 모드(REAL vs MOCK) 판별 및 변수 설정
         from core.database import get_trade_mode
-        trade_mode = get_trade_mode()
+        self.trade_mode = get_trade_mode()
 
-        if trade_mode == "MOCK":
+        if self.trade_mode == "MOCK":
             self.hts_id = os.getenv("MOCK_CLIENT_ID", "").strip()
             self.ws_url = os.getenv("MOCK_SOCKET_URL", "wss://mockapi.kiwoom.com:10000").strip()
         else:
@@ -82,12 +82,20 @@ class KisWebSocketClient:
         # 시장별 타임존 설정
         if self.market == "KR":
             market_tz = pytz.timezone('Asia/Seoul')
-            open_time = dtime(8, 0)
-            close_time = dtime(15, 50)
+            if self.trade_mode == "MOCK":
+                open_time = dtime(9, 0)
+                close_time = dtime(15, 30)
+            else:
+                open_time = dtime(9, 0)
+                close_time = dtime(15, 50)
         else: # US Market
             market_tz = pytz.timezone('America/New_York')
-            open_time = dtime(7, 0)
-            close_time = dtime(18, 0)
+            if self.trade_mode == "MOCK":
+                open_time = dtime(9, 30)
+                close_time = dtime(16, 0)
+            else:
+                open_time = dtime(7, 0)
+                close_time = dtime(18, 0)
 
         self.running = True
         connection_start_time = 0
