@@ -289,3 +289,16 @@
     - 사용자명 수정 저장 시 `system_config` 뿐만 아니라 `user_auth` DB 테이블의 실제 사용자 레코드까지 동기화되어 업데이트되도록 구현.
 *   **Portainer Stack 배포 가이드라인 보완**:
     - OCI 서버 터미널 CLI 방식 대신 웹 브라우저에서 Portainer Stack Editor를 열고 **"Re-pull image"** 옵션을 켜서 스택을 업데이트 및 재부팅하는 편리한 OCI 컨테이너 동기화 워크플로우를 정리 및 안내서([walkthrough.md](file:///C:/Users/simji/.gemini/antigravity-ide/brain/99e59c79-175c-4d89-9b23-ec3a00b2b1fb/walkthrough.md))에 등재.
+
+### 📅 2026-07-13 ~ 07-14 (모의투자 시간대 분리, 미국 공휴일 판단 최적화 및 웹소켓 세션 갱신 고도화)
+*   **모의투자 모드(`MOCK`) 전용 거래/웹소켓 운영 시간대 제한**:
+    - 모의계좌의 특성상 미국 프리마켓 및 애프터마켓 거래가 지원되지 않는 환경을 고려하여, 미국 정규장 운영 시간대(09:30 ~ 16:01 ET)에만 주문 제출 및 실시간 웹소켓 세션 유지가 가능하도록 스케줄러([scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py)), 웹소켓 클라이언트([ws_client.py](file:///d:/Python_D/kiwoom/core/ws_client.py)), 대시보드([dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py)) 내 운영 감시 시간대를 모의투자 모드 분기에 따라 제한함.
+    - 모의투자 시 프리마켓 지정가 매도 스케줄(`job_us_pre_market_limit_sells`)이 동작하지 않도록 예외 차단 추가.
+*   **미국 공휴일 판정 범위 확장 및 API 부하 차단 ([cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py))**:
+    - `is_us_market_holiday`에 6월 준틴스, 7월 독립기념일, 9월 노동절, 11월 추수감사절, 12월 크리스마스의 대체 휴일 판정 규칙을 구현하여 휴장 점검 신뢰성을 대폭 보강함.
+    - 기존에 20초 간격으로 `KiwoomUsBroker` API를 통해 TQQQ 시세를 반복 조회하여 개장 여부를 체킹하던 비효율적인 가격 변동 감지 방식(API 트래픽 소모 방식)을 전면 폐기하고, 오프라인 달력 기반 공휴일 로직과 사용자 정의 휴장일(`load_custom_holidays`) 비교만으로 안전하게 판정하도록 개선.
+*   **웹소켓 예외/인증 대응 및 견고화 ([ws_client.py](file:///d:/Python_D/kiwoom/core/ws_client.py))**:
+    - **URL 자동 보정**: `ws_url` 끝부분에 각 시장별 웹소켓 엔드포인트 경로(`/api/dostk/websocket` 또는 `/api/us/websocket`)가 누락되었을 시, 자동으로 이를 검출하여 규격에 맞게 덧붙여 연결하도록 자동 보정 로직 구현.
+    - **토큰 강제 재발급 및 세션 복구**: 실시간 세션 연결 중 웹소켓 서버로부터 로그인 세션 불일치나 만료 오류 코드(`100013`, `100018`, `100004` 등) 수신 시, 즉시 `_force_token_renew` 플래그를 올리고 연결을 차단(close). 이후 재연결 시 `get_access_token`에 `force=True`를 전달하여 확실히 API 토큰을 재생성하고 재연결을 수립하도록 세션 자동 복구 프로세스 구현.
+    - **기본 종목 구독 Fallback**: 시스템 내 활성화된 감시 전략이 없을 때, 에러 방지를 위해 환경 변수 `ticker` 또는 기본 설정 종목(KR: `122630`, `005930`, US: `SOXL`, `TQQQ`)을 자동으로 구독하도록 가드 적용.
+    - **구독 등록 규격 명시**: 체결 및 실시간 등록 데이터 전송 시 JSON 명세의 `"trnm": "REG"` 필드를 항상 누락 없이 포함하도록 수정.

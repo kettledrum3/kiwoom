@@ -64,6 +64,11 @@ class KisWebSocketClient:
             self.hts_id = os.getenv("KIWOOM_CLIENT_ID", "").strip()
             self.ws_url = os.getenv("KIWOOM_SOCKET_URL", "wss://api.kiwoom.com:10000").strip()
 
+        # 웹소켓 URI 경로 자동 추가
+        ws_path = "/api/dostk/websocket" if self.market == "KR" else "/api/us/websocket"
+        if not self.ws_url.endswith(ws_path):
+            self.ws_url = self.ws_url.rstrip('/') + ws_path
+
         self._broker = None
             
         self.approval_key = None
@@ -71,6 +76,7 @@ class KisWebSocketClient:
         self.retry_attempts = 0
         self._websocket = None
         self.ping_task = None
+        self._force_token_renew = False
         self._prev_close_cache = {}
         self._last_db_update = {}
         self._last_cache_date = None
@@ -167,7 +173,9 @@ class KisWebSocketClient:
                     logger.info(f"🚀 [WS] {self.market} 실시간 감시를 위한 브로커를 시작합니다.")
 
                 # 키움증권은 웹소켓 승인키로 접근 토큰을 그대로 사용함
-                self.approval_key = get_access_token(self.market)
+                self.approval_key = get_access_token(self.market, force=self._force_token_renew)
+                if self._force_token_renew:
+                    self._force_token_renew = False # 리셋
                 if not self.approval_key:
                     logger.error(f"[WS] {self.market} Access Token(웹소켓용) 획득 실패. 1분 후 재시도.")
                     await asyncio.sleep(60)
@@ -265,6 +273,7 @@ class KisWebSocketClient:
         """체결 통보 구독 요청 (00 또는 F5)"""
         api_id = "00" if self.market == "KR" else "F5"
         data = {
+            "trnm": "REG",
             "header": {
                 "api-id": api_id,
                 "authorization": f"Bearer {self.approval_key}"
@@ -287,8 +296,19 @@ class KisWebSocketClient:
         all_states = get_all_states_db(market=self.market)
         active_symbols = set(s['symbol'] for s in all_states if s.get('is_active', True))
         
+        if not active_symbols:
+            default_ticker = os.getenv("ticker", "").strip().upper()
+            if default_ticker:
+                active_symbols.add(default_ticker)
+            if self.market == "KR":
+                active_symbols.update(["122630", "005930"])
+            else:
+                active_symbols.update(["SOXL", "TQQQ"])
+            logger.info(f"[WS] 설정된 활성 전략이 없습니다. 기본 종목을 구독합니다: {active_symbols}")
+        
         for symbol in active_symbols:
             data = {
+                "trnm": "REG",
                 "header": {
                     "api-id": api_id,
                     "authorization": f"Bearer {self.approval_key}"
@@ -321,6 +341,14 @@ class KisWebSocketClient:
             # Control Message 수신 기록
             if trnm != "REAL":
                 logger.info(f"[WS] {self.market} Control Message received: {message}")
+                
+                # 로그인 세션 불일치/부재 오류 처리 (예: return_code == 100013, 100018, 100004)
+                ret_code = data.get('return_code')
+                if ret_code in [100013, 100018, 100004, "100013", "100018", "100004"]:
+                    logger.warning(f"⚠️ [WS] {self.market} 로그인 세션/인증 오류 감지 (코드: {ret_code}). 토큰 강제 재발급 및 재연결 준비.")
+                    self._force_token_renew = True
+                    if self._websocket:
+                        await self._websocket.close()
                 return
 
             # 실시간 데이터 파싱 (trnm == "REAL")

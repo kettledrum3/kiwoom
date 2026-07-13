@@ -8,7 +8,7 @@ import csv
 import pytz
 import urllib3
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta, date
 import threading
 from pytz import timezone
 from dataclasses import dataclass, asdict
@@ -67,7 +67,7 @@ def invalidate_access_token_controlled(market: str, account_no: str):
         delete_api_token_db(account_no)
         _last_token_invalidated_time[market] = now
 
-def get_access_token(market: str = "US") -> str:
+def get_access_token(market: str = "US", force: bool = False) -> str:
     global _last_token_fail_times
     market = market.upper()
 
@@ -107,32 +107,37 @@ def get_access_token(market: str = "US") -> str:
 
     now = time.time()
 
-    # 1. DB에서 토큰 로드
-    db_token_info = load_api_token_db(account_no)
-    
-    if db_token_info:
-        db_token = db_token_info.get("token")
-        db_expires_at = db_token_info.get("expires_at", 0)
-
-        # 만료 60초 전까지 유효
-        if db_token and now < db_expires_at - 60:
-            return db_token
-        else:
-            logger.info(f"[{market}] DB 토큰 만료 또는 만료 임박. 재발급 시도.")
-            _token_fail_count[account_no] = 0 # 만료된 토큰이라도 DB에 있었으면 실패 카운트 초기화
-    else:
-        logger.info(f"[{market}] DB에 저장된 토큰 없음. 신규 발급 시도.")
-
-    # 2. API 호출하여 신규 발급 (Lock을 통해 단일 스레드만 접근 허용)
-    with _token_fetch_lock:
-        # Lock을 얻은 후 다시 한번 DB 확인 (다른 스레드가 이미 업데이트했을 수 있음)
+    # 1. DB에서 토큰 로드 (force가 아닐 때만)
+    db_token = None
+    db_expires_at = 0
+    if not force:
         db_token_info = load_api_token_db(account_no)
         if db_token_info:
             db_token = db_token_info.get("token")
             db_expires_at = db_token_info.get("expires_at", 0)
-            
+
+            # 만료 60초 전까지 유효
             if db_token and now < db_expires_at - 60:
                 return db_token
+            else:
+                logger.info(f"[{market}] DB 토큰 만료 또는 만료 임박. 재발급 시도.")
+                _token_fail_count[account_no] = 0 # 만료된 토큰이라도 DB에 있었으면 실패 카운트 초기화
+        else:
+            logger.info(f"[{market}] DB에 저장된 토큰 없음. 신규 발급 시도.")
+    else:
+        logger.info(f"[{market}] 토큰 재발급 강제 요청됨. 신규 발급 시도.")
+
+    # 2. API 호출하여 신규 발급 (Lock을 통해 단일 스레드만 접근 허용)
+    with _token_fetch_lock:
+        if not force:
+            # Lock을 얻은 후 다시 한번 DB 확인 (다른 스레드가 이미 업데이트했을 수 있음)
+            db_token_info = load_api_token_db(account_no)
+            if db_token_info:
+                db_token = db_token_info.get("token")
+                db_expires_at = db_token_info.get("expires_at", 0)
+                
+                if db_token and now < db_expires_at - 60:
+                    return db_token
 
         # 쿨다운 확인
         if account_no in _last_token_fail_times and _last_token_fail_times[account_no] != 0 and now - _last_token_fail_times[account_no] < 60:
@@ -229,65 +234,279 @@ def get_websocket_approval_key(market: str = "US") -> str:
         logger.error(f"[{market}] Approval Key 발급 실패: {e}")
         return None
 
+KR_MARKET_HOLIDAYS = {
+    2025: {
+        (1, 1),    # 신정
+        (1, 28),   # 설날 연휴
+        (1, 29),
+        (1, 30),
+        (3, 3),    # 삼일절 대체공휴일
+        (5, 1),    # 근로자의 날
+        (5, 5),    # 어린이날
+        (5, 6),    # 석가탄신일 대체공휴일
+        (6, 6),    # 현충일
+        (8, 15),   # 광복절
+        (10, 3),   # 개천절
+        (10, 5),   # 추석 연휴
+        (10, 6),
+        (10, 7),
+        (10, 8),   # 추석 대체공휴일
+        (10, 9),   # 한글날
+        (12, 25),  # 성탄절
+        (12, 31)   # 연말 휴장일
+    },
+    2026: {
+        (1, 1),    # 신정
+        (2, 16),   # 설날 연휴
+        (2, 17),
+        (2, 18),
+        (3, 2),    # 삼일절 대체공휴일
+        (5, 1),    # 근로자의 날
+        (5, 5),    # 어린이날
+        (5, 24),   # 부처님오신날
+        (5, 25),   # 부처님오신날 대체공휴일
+        (6, 3),    # 지방선거
+        (6, 6),    # 현충일
+        (7, 17),   # 제헌절
+        (8, 15),   # 광복절
+        (8, 17),   # 광복절 대체공휴일
+        (9, 24),   # 추석 연휴
+        (9, 25),
+        (9, 26),
+        (9, 28),   # 추석 대체공휴일
+        (10, 3),   # 개천절
+        (10, 5),   # 개천절 대체공휴일
+        (10, 9),   # 한글날
+        (12, 25),  # 성탄절
+        (12, 31)   # 연말 휴장일
+    },
+    2027: {
+        (1, 1),    # 신정
+        (2, 6),    # 설날 연휴
+        (2, 7),
+        (2, 8),
+        (2, 9),    # 설날 대체공휴일
+        (3, 1),    # 삼일절
+        (5, 1),    # 근로자의 날
+        (5, 5),    # 어린이날
+        (5, 13),   # 석가탄신일
+        (6, 6),    # 현충일
+        (6, 7),    # 현충일 대체공휴일
+        (8, 15),   # 광복절
+        (8, 16),   # 광복절 대체공휴일
+        (9, 14),   # 추석 연휴
+        (9, 15),
+        (9, 16),
+        (10, 3),   # 개천절
+        (10, 4),   # 개천절 대체공휴일
+        (10, 9),   # 한글날
+        (12, 25),  # 성탄절
+        (12, 31)   # 연말 휴장일
+    }
+}
+
+def load_custom_holidays(market: str) -> dict:
+    """env/custom_holidays.json 파일에서 사용자 정의 휴장일/영업시간 일정을 로드합니다."""
+    default_data = {"holidays": [], "special_hours": {}}
+    file_path = os.path.join(PROJECT_ROOT, "env", "custom_holidays.json")
+    if not os.path.exists(file_path):
+        return default_data
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get(market, default_data)
+    except Exception as e:
+        logger.error(f"[{market}] custom_holidays.json 로드 실패: {e}")
+        return default_data
+
+def get_market_hours(market: str, trade_mode: str, current_time: datetime) -> Tuple[dtime, dtime]:
+    """시장별/거래 모드별 운영 시작 시간과 종료 시간을 반환하며, 사용자 정의 일정을 반영합니다."""
+    # 1. 기본 운영 시간 설정
+    if market == "KR":
+        if trade_mode == "MOCK":
+            open_time = dtime(9, 0)
+            close_time = dtime(15, 30)
+        else:
+            # 실계좌 (대시보드/스케줄러에 따라 장전/장후 시간 반영)
+            open_time = dtime(0, 0)
+            close_time = dtime(23, 59)
+    else: # US
+        if trade_mode == "MOCK":
+            open_time = dtime(9, 30)
+            close_time = dtime(16, 0)
+        else:
+            open_time = dtime(0, 0)
+            close_time = dtime(23, 59)
+
+    # 2. env/custom_holidays.json의 special_hours 오버라이드 확인
+    custom_data = load_custom_holidays(market)
+    date_str = current_time.strftime('%Y-%m-%d')
+    special_hours = custom_data.get("special_hours", {})
+    if date_str in special_hours:
+        try:
+            sh = special_hours[date_str]
+            open_str = sh.get("open")
+            close_str = sh.get("close")
+            if open_str:
+                oh, om = map(int, open_str.split(":"))
+                open_time = dtime(oh, om)
+            if close_str:
+                ch, cm = map(int, close_str.split(":"))
+                close_time = dtime(ch, cm)
+            logger.info(f"[{market}] 사용자 정의 특별 운영 시간 적용: {date_str} {open_time}~{close_time}")
+        except Exception as e:
+            logger.error(f"[{market}] 사용자 정의 운영 시간 파싱 오류: {e}")
+
+    return open_time, close_time
+
 def fetch_kr_holiday(target_date: str = None) -> bool:
     """
     국내 휴장일 여부를 조회합니다.
-    키움증권은 휴장일 조회 API가 없으므로 주말 여부만 체크하고 평일은 개장일로 간주합니다.
+    - True: 개장일
+    - False: 휴장일 (주말 또는 공휴일)
     """
     try:
         kr_tz = timezone('Asia/Seoul')
         now_kr = datetime.now(kr_tz)
+
+        # 0. 사용자 정의 휴장일 체크
+        custom_data = load_custom_holidays("KR")
+        date_str = now_kr.strftime('%Y-%m-%d')
+        if date_str in custom_data.get("holidays", []):
+            logger.info(f"[KR Holiday Check] 사용자 정의 휴장일로 감지됨: {date_str}")
+            return False
+
+        # 1. 주말 체크
         if now_kr.weekday() >= 5:
             logger.info(f"[KR Holiday Check] 오늘은 한국 시장 주말({now_kr.strftime('%A')})입니다.")
             return False
+
+        year = now_kr.year
+        month = now_kr.month
+        day = now_kr.day
+
+        if year in KR_MARKET_HOLIDAYS:
+            if (month, day) in KR_MARKET_HOLIDAYS[year]:
+                logger.info(f"[KR Holiday Check] 오늘은 한국 시장 공휴일({now_kr.strftime('%Y-%m-%d')})입니다.")
+                return False
+
+        logger.info(f"[KR Holiday Check] 오늘은 한국 시장 개장일({now_kr.strftime('%Y-%m-%d')})입니다.")
+        return True
     except Exception as e:
         logger.error(f"[KR Holiday] 오류 발생: {e}")
     return True
 
+def is_us_market_holiday(d: datetime) -> bool:
+    """미국 주식시장(NYSE/NASDAQ) 공식 10대 공휴일 판정"""
+    year = d.year
+    month = d.month
+    day = d.day
+    
+    # 1. 신정 (New Year's Day) - 1월 1일. 일요일이면 1월 2일 대체 휴업
+    if month == 1 and day == 1:
+        return True
+    if month == 1 and day == 2 and d.weekday() == 0:
+        return True
+        
+    # 2. 마틴 루터 킹 주니어 날 (MLK Day) - 1월 세 번째 월요일 (15일 ~ 21일 사이)
+    if month == 1 and d.weekday() == 0 and 15 <= day <= 21:
+        return True
+        
+    # 3. 대통령의 날 (Presidents' Day) - 2월 세 번째 월요일 (15일 ~ 21일 사이)
+    if month == 2 and d.weekday() == 0 and 15 <= day <= 21:
+        return True
+        
+    # 4. 성금요일 (Good Friday) - 부활절 이틀 전 (Meeus/Jones/Butcher 알고리즘)
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d_part = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d_part - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    L = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * L) // 451
+    month_easter = (h + L - 7 * m + 114) // 31
+    day_easter = ((h + L - 7 * m + 114) % 31) + 1
+    
+    easter_date = date(year, month_easter, day_easter)
+    good_friday_date = easter_date - timedelta(days=2)
+    if month == good_friday_date.month and day == good_friday_date.day:
+        return True
+
+    # 5. 메모리얼 데이 (Memorial Day) - 5월 마지막 월요일 (25일 ~ 31일 사이)
+    if month == 5 and d.weekday() == 0 and 25 <= day <= 31:
+        return True
+
+    # 6. 준틴스 (Juneteenth) - 6월 19일. 일요일이면 20일(월), 토요일이면 18일(금) 대체 휴업
+    if month == 6:
+        if day == 19:
+            return True
+        if day == 20 and d.weekday() == 0:
+            return True
+        if day == 18 and d.weekday() == 4:
+            return True
+
+    # 7. 독립기념일 (Independence Day) - 7월 4일. 일요일이면 5일(월), 토요일이면 3일(금) 대체 휴업
+    if month == 7:
+        if day == 4:
+            return True
+        if day == 5 and d.weekday() == 0:
+            return True
+        if day == 3 and d.weekday() == 4:
+            return True
+
+    # 8. 노동절 (Labor Day) - 9월 첫 번째 월요일 (1일 ~ 7일 사이)
+    if month == 9 and d.weekday() == 0 and 1 <= day <= 7:
+        return True
+
+    # 9. 추수감사절 (Thanksgiving Day) - 11월 네 번째 목요일 (22일 ~ 28일 사이)
+    if month == 11 and d.weekday() == 3 and 22 <= day <= 28:
+        return True
+
+    # 10. 크리스마스 (Christmas Day) - 12월 25일. 일요일이면 26일(월), 토요일이면 24일(금) 대체 휴업
+    if month == 12:
+        if day == 25:
+            return True
+        if day == 26 and d.weekday() == 0:
+            return True
+        if day == 24 and d.weekday() == 4:
+            return True
+
+    return False
+
 def fetch_us_holiday() -> bool:
     """
     미국 휴장일 여부를 조회합니다.
-    - 주말은 휴장.
-    - 평일: KiwoomUsBroker를 이용해 현재가를 20초 간격으로 3번 조회하여 가격 변동을 확인.
-    - 총 2세트까지 시도.
+    - True: 개장일
+    - False: 휴장일 (주말 또는 공휴일)
     """
     try:
         ny_tz = timezone('America/New_York')
         now_ny = datetime.now(ny_tz)
+
+        # 0. 사용자 정의 휴장일 체크
+        custom_data = load_custom_holidays("US")
+        date_str = now_ny.strftime('%Y-%m-%d')
+        if date_str in custom_data.get("holidays", []):
+            logger.info(f"[US Holiday Check] 사용자 정의 휴장일로 감지됨: {date_str}")
+            return False
 
         # 1. 주말 체크
         if now_ny.weekday() >= 5:
             logger.info(f"[US Holiday Check] 오늘은 미국 시장 주말({now_ny.strftime('%A')})입니다.")
             return False
 
-        from core.brokers.kiwoom_us import KiwoomUsBroker
-        broker = KiwoomUsBroker()
+        # 2. 공휴일 체크
+        if is_us_market_holiday(now_ny):
+            logger.info(f"[US Holiday Check] 오늘은 미국 시장 공휴일({now_ny.strftime('%Y-%m-%d')})입니다.")
+            return False
 
-        for attempt in range(1, 3):
-            prices = []
-            logger.info(f"[US Holiday Check] {attempt}차 시도 시작 (20초 간격 3회 조회)")
-            for i in range(3):
-                last_price = broker.get_price("TQQQ")
-                if last_price > 0:
-                    prices.append(last_price)
-                    logger.info(f"[US Holiday Check] 시도 {attempt}-{i+1}: {last_price}")
-                
-                if i < 2:
-                    time.sleep(20)
-
-            # 가격 변동 확인
-            if len(prices) == 3 and not all(p == prices[0] for p in prices):
-                logger.info(f"[US Holiday Check] {attempt}차 시도에서 가격 변동 확인됨. 오늘은 개장일입니다.")
-                return True
-            
-            logger.warning(f"[US Holiday Check] {attempt}차 시도에서 가격 변동 없음.")
-            
-            if attempt == 1:
-                logger.info("[US Holiday Check] 1차 시도 변동 없음. 1분 대기 후 2차 시도를 진행합니다.")
-                time.sleep(60)
-
-        logger.info(f"[US Holiday Check] 총 2차 시도 동안 가격 변동 없음. 휴장일로 판정합니다.")
-        return False
+        logger.info(f"[US Holiday Check] 오늘은 미국 시장 개장일({now_ny.strftime('%Y-%m-%d')})입니다.")
+        return True
     except Exception as e:
         logger.error(f"[US Holiday Check] 오류 발생: {e}")
     return True # 오류 발생 시 보수적으로 개장일로 간주
