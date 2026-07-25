@@ -58,7 +58,8 @@ class KisWebSocketClient:
         self.trade_mode = get_trade_mode()
 
         if self.trade_mode == "MOCK":
-            self.hts_id = os.getenv("MOCK_CLIENT_ID", "").strip()
+            prefix = "MOCKKR_" if self.market == "KR" else "MOCKUS_"
+            self.hts_id = os.getenv(f"{prefix}CLIENT_ID", "").strip()
             self.ws_url = os.getenv("MOCK_SOCKET_URL", "wss://mockapi.kiwoom.com:10000").strip()
         else:
             self.hts_id = os.getenv("KIWOOM_CLIENT_ID", "").strip()

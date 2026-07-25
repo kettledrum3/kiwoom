@@ -88,10 +88,11 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
     trade_mode = get_trade_mode()
 
     if trade_mode == "MOCK":
-        app_key = str(env_config.get("MOCK_APP_KEY", "")).strip()
-        app_secret = str(env_config.get("MOCK_SECRET_KEY", "")).strip()
+        prefix = "MOCKKR_" if market == "KR" else "MOCKUS_"
+        app_key = str(env_config.get(f"{prefix}APP_KEY", "")).strip()
+        app_secret = str(env_config.get(f"{prefix}SECRET_KEY", "")).strip()
         base_url = env_config.get("MOCK_BASE_URL", "https://mockapi.kiwoom.com").strip()
-        account_no = str(env_config.get("MOCK_ACCOUNT_NO", "")).strip()
+        account_no = str(env_config.get(f"{prefix}ACCOUNT_NO", "")).strip()
     else:
         app_key = str(env_config.get("KIWOOM_APP_KEY", "")).strip()
         app_secret = str(env_config.get("KIWOOM_SECRET_KEY", "")).strip()

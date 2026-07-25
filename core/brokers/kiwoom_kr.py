@@ -39,7 +39,7 @@ class KiwoomKrBroker(Broker):
 
         if trade_mode == "MOCK":
             self.base_url = os.getenv("MOCK_BASE_URL", "https://mockapi.kiwoom.com").strip()
-            self.account_no = os.getenv("MOCK_ACCOUNT_NO", "").strip()
+            self.account_no = os.getenv("MOCKKR_ACCOUNT_NO", "").strip()
             self.is_simulation = True
             mode_display = "모의 계좌 (MOCK)"
         else:
