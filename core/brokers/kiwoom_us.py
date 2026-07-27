@@ -328,26 +328,33 @@ class KiwoomUsBroker(Broker):
         tr_id = "ust20000" if action == "BUY" else "ust20001"
         url = f"{self.base_url}/api/us/ordr"
 
+        # 미국주식 단가는 $1 미만 소수점 4자리, $1 이상 소수점 2자리까지만 입력 가능함
+        def format_price(p: float) -> str:
+            if p < 1.0:
+                return f"{p:.4f}"
+            else:
+                return f"{p:.2f}"
+
         # KIS의 "00" 지정가, "01" 시장가, "34" LOC를 키움 규격인 "00", "03", "30"으로 보정
         if price_type in ["00", "0"]:
             frgn_trde_tp = "00"
-            ord_uv = f"{price:.4f}"
+            ord_uv = format_price(price)
         elif price_type in ["01", "3"]:
             frgn_trde_tp = "03"
             ord_uv = "0.0" # 시장가는 가격 0으로 제출
         elif price_type in ["34", "30"]:
             frgn_trde_tp = "30"
-            ord_uv = f"{price:.4f}"
+            ord_uv = format_price(price)
         else:
             frgn_trde_tp = "00"
-            ord_uv = f"{price:.4f}"
+            ord_uv = format_price(price)
 
         body = {
             "stex_tp": self._get_exchange(symbol),
             "stk_cd": symbol,
             "ord_qty": str(int(qty)),
             "ord_uv": ord_uv,
-            "frgn_trde_tp": frgn_trde_tp
+            "trde_tp": frgn_trde_tp
         }
 
         try:

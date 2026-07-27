@@ -1996,9 +1996,9 @@ if mode == "실전 투자":
                     df_orders['주문유형'] = df_orders['type'].map(lambda x: ORDER_TYPE_MAP.get(x, x))
                     # 가격 컬럼을 소수점 4자리 문자열로 변환하여 확인 가능하게 함
                     if market_code == "KR":
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(x):,}")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(float(x)):,}" if x is not None and str(x).strip() != "" else "0")
                     else:
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{x:.4f}")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{float(x):.4f}" if x is not None and str(x).strip() != "" else "0.0000")
                     df_orders = df_orders.rename(columns={'strategy_name': '별칭'}) # Rename strategy_name to 별칭
                     disp_cols = ['timestamp', 'symbol', '별칭', 'side', '가격', 'qty', '주문유형', 'status', 'odno']
                     df_orders = df_orders[disp_cols].rename(columns={'timestamp': '시간', 'symbol': 'Ticker', 'side': '구분', 'qty': '수량'})
@@ -2286,9 +2286,9 @@ if mode == "실전 투자":
                     df_orders['주문유형'] = df_orders['type'].map(lambda x: ORDER_TYPE_MAP.get(x, x))
                     # 가격 컬럼을 소수점 4자리 문자열로 변환하여 확인 가능하게 함
                     if market_code == "KR":
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(x):,}")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(float(x)):,}" if x is not None and str(x).strip() != "" else "0")
                     else:
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{x:.4f}")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{float(x):.4f}" if x is not None and str(x).strip() != "" else "0.0000")
                     df_orders = df_orders.rename(columns={'strategy_name': '별칭'}) # Rename strategy_name to 별칭
                     disp_cols = ['timestamp', 'symbol', '별칭', 'side', '가격', 'qty', '주문유형', 'status', 'odno']
                     df_orders = df_orders[disp_cols].rename(columns={'timestamp': '시간', 'symbol': 'Ticker', 'side': '구분', 'qty': '수량'})
