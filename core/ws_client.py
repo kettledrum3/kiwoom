@@ -272,6 +272,13 @@ class KisWebSocketClient:
     async def subscribe(self, websocket):
         """체결 통보 구독 요청 (00 또는 F5)"""
         api_id = "00" if self.market == "KR" else "F5"
+        
+        # 미국 시장(F5)인 경우, 규격상 리스트 내 맵 구조 문자열을 사용해야 파싱 실패 및 100013 에러를 예방할 수 있음
+        if self.market == "US":
+            item_val = '[{"jmcode":"TQQQ","stex_tp":"ND"}]'
+        else:
+            item_val = ""
+            
         data = {
             "trnm": "REG",
             "header": {
@@ -283,12 +290,12 @@ class KisWebSocketClient:
                 "grp_no": "1",
                 "refresh": "1",
                 "data": None,
-                "- item": "",
+                "- item": item_val,
                 "- type": api_id
             }
         }
         await websocket.send(json.dumps(data))
-        logger.info(f"[WS] {self.market} 체결 통보 구독 요청 전송 (api-id: {api_id})")
+        logger.info(f"[WS] {self.market} 체결 통보 구독 요청 전송 (api-id: {api_id}, item: {item_val})")
 
     async def subscribe_prices(self, websocket):
         """실시간 시세 구독 요청 (0B 또는 FE)"""
@@ -345,8 +352,12 @@ class KisWebSocketClient:
                 # 로그인 세션 불일치/부재 오류 처리 (예: return_code == 100013, 100018, 100004)
                 ret_code = data.get('return_code')
                 if ret_code in [100013, 100018, 100004, "100013", "100018", "100004"]:
-                    logger.warning(f"⚠️ [WS] {self.market} 로그인 세션/인증 오류 감지 (코드: {ret_code}). 토큰 강제 재발급 및 재연결 준비.")
-                    self._force_token_renew = True
+                    if self.retry_attempts >= 3:
+                        logger.warning(f"⚠️ [WS] {self.market} 로그인 인증 오류 지속 감지 ({self.retry_attempts}회). REST API 보호를 위해 토큰 강제 갱신을 억제하고 기존 토큰을 보존합니다.")
+                        self._force_token_renew = False
+                    else:
+                        logger.warning(f"⚠️ [WS] {self.market} 로그인 세션/인증 오류 감지 (코드: {ret_code}). 토큰 강제 재발급 및 재연결 준비.")
+                        self._force_token_renew = True
                     if self._websocket:
                         await self._websocket.close()
                     return
