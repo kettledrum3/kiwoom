@@ -83,6 +83,7 @@ class KisWebSocketClient:
         self._last_cache_date = None
         self.tz = pytz.timezone('Asia/Seoul' if self.market == "KR" else 'America/New_York')
         self._cache_lock = threading.Lock()
+        self.is_subscribed_prices = False
 
     async def connect(self):
         """웹소켓 연결 및 데이터 수신 메인 루프"""
@@ -185,17 +186,15 @@ class KisWebSocketClient:
                 logger.info(f"[WS] {self.market} 웹소켓 연결 시도 중... (URL: {self.ws_url})")
                 async with websockets.connect(self.ws_url, ping_interval=None, close_timeout=10) as websocket:
                     self._websocket = websocket
+                    self.is_subscribed_prices = False # 실시간 시세 구독 여부 플래그 초기화
                     connection_start_time = time.time()
                     logger.info(f"✅ [WS] {self.market} 웹소켓 서버에 연결되었습니다.")
                     
                     # 클라이언트 주도 PING 루프 시작 (키움 규격에 맞춤)
                     self.ping_task = asyncio.create_task(self._ping_loop(websocket))
                     
-                    # 체결 통보 구독 요청
+                    # 체결 통보 구독 요청 (로그인 인증)
                     await self.subscribe(websocket)
-                    
-                    # 실시간 시세 구독 요청
-                    await self.subscribe_prices(websocket)
 
                     # 메시지 수신 루프
                     while self.running:
@@ -350,6 +349,16 @@ class KisWebSocketClient:
                     self._force_token_renew = True
                     if self._websocket:
                         await self._websocket.close()
+                    return
+
+                # 로그인 인증(체결 통보 등록 완료) 성공 시 실시간 시세 구독 트리거
+                msg_api_id = header.get('api-id')
+                target_api_id = "00" if self.market == "KR" else "F5"
+                if trnm == "REG" and (msg_api_id == target_api_id or msg_api_id is None):
+                    if ret_code in [0, "0", "000000", None] and not self.is_subscribed_prices:
+                        logger.info(f"🔑 [WS] {self.market} 로그인 인증(체결 통보 등록) 확인 성공. 실시간 시세 구독을 진행합니다.")
+                        self.is_subscribed_prices = True
+                        asyncio.create_task(self.subscribe_prices(self._websocket))
                 return
 
             # 실시간 데이터 파싱 (trnm == "REAL")
