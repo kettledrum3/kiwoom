@@ -55,13 +55,14 @@ class KiwoomKrBroker(Broker):
             KiwoomKrBroker._notified = True
 
         self.cano = self.account_no
+        self.trade_mode = trade_mode
         self.etf_tickers = self._load_etf_list()
 
     def _call_api(self, method, url, tr_id, params=None, data=None, extra_headers=None):
         max_retries = 3
         for attempt in range(max_retries):
             # KIS 헤더 함수를 호출하여 키움 REST 헤더(api-id, authorization)를 생성함
-            headers = kis_headers(tr_id, market="KR")
+            headers = kis_headers(tr_id, market="KR", trade_mode=self.trade_mode)
             if not headers:
                 logger.warning(f"⚠️ [KR API] 헤더 생성 실패 (토큰 쿨다운 중). 5초 대기 후 재시도 ({attempt+1}/{max_retries})")
                 time.sleep(5.0)
@@ -85,7 +86,7 @@ class KiwoomKrBroker(Broker):
             # 토큰 만료 대응 (401 Unauthorized)
             if res.status_code == 401:
                 logger.warning(f"⚠️ [KR API] 토큰 만료(401). 1초 대기 후 재발급 및 재시도.")
-                invalidate_access_token_controlled(market="KR", account_no=self.account_no)
+                invalidate_access_token_controlled(market="KR", account_no=self.account_no, trade_mode=self.trade_mode)
                 time.sleep(1.0)
                 continue
             
@@ -102,6 +103,13 @@ class KiwoomKrBroker(Broker):
                 rt_msg = res_data.get('return_msg', '')
                 logger.debug(f"[KR API Resp] TR_ID: {tr_id}, rt_cd: {rt_cd}, msg: {rt_msg}")
                 
+                # 토큰 오류 감지 및 대응
+                if rt_msg and any(x in rt_msg for x in ["Token", "token", "토큰", "투자구분"]):
+                    logger.warning(f"⚠️ [KR API] 토큰 오류 감지 ({rt_msg}). 토큰 무효화 후 재발급 재시도.")
+                    invalidate_access_token_controlled(market="KR", account_no=self.account_no, trade_mode=self.trade_mode)
+                    time.sleep(1.0)
+                    continue
+
                 # TPS 제한 감지 및 대응
                 if rt_msg and "초당 거래건수를 초과" in rt_msg:
                     logger.warning(f"⚠️ [KR API] TPS 제한 감지. 2초 후 재시도 ({attempt+1}/{max_retries})")
@@ -319,12 +327,12 @@ class KiwoomKrBroker(Broker):
             if data.get('return_code') == 0:
                 odno = data.get('ord_no')
                 logger.info(f"🟢 [KR 주문 성공] {strategy} {action} {symbol} {qty}주 @ {price} (주문번호: {odno})")
-                log_order_db(symbol, strategy, "KR", action, price, qty, trde_tp, "ORDERED", odno, "성공", strategy)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "ORDERED", odno, "성공", market="KR", strategy_name=strategy)
                 return True
             else:
                 msg = data.get('return_msg', '알 수 없는 오류')
                 logger.error(f"🔴 [KR 주문 실패] {strategy} {action} {symbol} {qty}주 @ {price} -> {msg}")
-                log_order_db(symbol, strategy, "KR", action, price, qty, trde_tp, "FAILED", "", msg, strategy)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "FAILED", "", msg, market="KR", strategy_name=strategy)
                 send_telegram_message(f"🔴 <b>[KR 주문 실패]</b>\n종목: {symbol}\n유형: {action}\n사유: {msg}")
                 return False
         except Exception as e:

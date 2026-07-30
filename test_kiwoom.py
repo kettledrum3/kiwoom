@@ -7,6 +7,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TestKiwoom")
 
+from core.database import init_db
+init_db()
+
 from core.cavr import get_access_token
 from core.brokers.kiwoom_kr import KiwoomKrBroker
 from core.brokers.kiwoom_us import KiwoomUsBroker

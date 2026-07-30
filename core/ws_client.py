@@ -87,29 +87,53 @@ class KisWebSocketClient:
 
     async def connect(self):
         """웹소켓 연결 및 데이터 수신 메인 루프"""
-        # 시장별 타임존 설정
-        if self.market == "KR":
-            market_tz = pytz.timezone('Asia/Seoul')
-            if self.trade_mode == "MOCK":
-                open_time = dtime(9, 0)
-                close_time = dtime(15, 30)
-            else:
-                open_time = dtime(9, 0)
-                close_time = dtime(15, 50)
-        else: # US Market
-            market_tz = pytz.timezone('America/New_York')
-            if self.trade_mode == "MOCK":
-                open_time = dtime(9, 30)
-                close_time = dtime(16, 0)
-            else:
-                open_time = dtime(7, 0)
-                close_time = dtime(18, 0)
-
         self.running = True
         connection_start_time = 0
 
         while self.running:
             try:
+                # 1. 거래 모드(REAL vs MOCK) 동적 갱신
+                from core.database import get_trade_mode
+                self.trade_mode = get_trade_mode()
+                
+                # 시장별 환경 변수 재설정 (모드 변경 대비)
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                env_suffix = "kr" if self.market == "KR" else "us"
+                env_path = os.path.join(project_root, "env", f".env.{env_suffix}")
+                if os.path.exists(env_path):
+                    from dotenv import load_dotenv
+                    load_dotenv(env_path, override=True)
+                    
+                if self.trade_mode == "MOCK":
+                    prefix = "MOCKKR_" if self.market == "KR" else "MOCKUS_"
+                    self.hts_id = os.getenv(f"{prefix}CLIENT_ID", "").strip()
+                    self.ws_url = os.getenv("MOCK_SOCKET_URL", "wss://mockapi.kiwoom.com:10000").strip()
+                else:
+                    self.hts_id = os.getenv("KIWOOM_CLIENT_ID", "").strip()
+                    self.ws_url = os.getenv("KIWOOM_SOCKET_URL", "wss://api.kiwoom.com:10000").strip()
+
+                ws_path = "/api/dostk/websocket" if self.market == "KR" else "/api/us/websocket"
+                if not self.ws_url.endswith(ws_path):
+                    self.ws_url = self.ws_url.rstrip('/') + ws_path
+
+                # 시장별 타임존 및 운영 시간 설정 동적 업데이트
+                if self.market == "KR":
+                    market_tz = pytz.timezone('Asia/Seoul')
+                    if self.trade_mode == "MOCK":
+                        open_time = dtime(9, 0)
+                        close_time = dtime(15, 30)
+                    else:
+                        open_time = dtime(9, 0)
+                        close_time = dtime(15, 50)
+                else: # US Market
+                    market_tz = pytz.timezone('America/New_York')
+                    if self.trade_mode == "MOCK":
+                        open_time = dtime(9, 30)
+                        close_time = dtime(16, 0)
+                    else:
+                        open_time = dtime(7, 0)
+                        close_time = dtime(18, 0)
+
                 if self.retry_attempts == 0:
                     await asyncio.sleep(2)
 
@@ -168,6 +192,11 @@ class KisWebSocketClient:
                     await asyncio.sleep(actual_sleep)
                     continue
 
+                # 만약 기존 브로커가 있고, 그 브로커의 trade_mode가 현재 self.trade_mode와 다르다면 브로커 재생성
+                if self._broker is not None and getattr(self._broker, 'trade_mode', None) != self.trade_mode:
+                    logger.info(f"🔄 [WS] {self.market} 거래 모드 변경 감지 ({self._broker.trade_mode} -> {self.trade_mode}). 브로커를 재구성합니다.")
+                    self._broker = None
+
                 if self._broker is None:
                     from core.brokers.kiwoom_kr import KiwoomKrBroker
                     from core.brokers.kiwoom_us import KiwoomUsBroker
@@ -175,7 +204,7 @@ class KisWebSocketClient:
                     logger.info(f"🚀 [WS] {self.market} 실시간 감시를 위한 브로커를 시작합니다.")
 
                 # 키움증권은 웹소켓 승인키로 접근 토큰을 그대로 사용함
-                self.approval_key = get_access_token(self.market, force=self._force_token_renew)
+                self.approval_key = get_access_token(self.market, force=self._force_token_renew, trade_mode=self.trade_mode)
                 if self._force_token_renew:
                     self._force_token_renew = False # 리셋
                 if not self.approval_key:
@@ -183,8 +212,20 @@ class KisWebSocketClient:
                     await asyncio.sleep(60)
                     continue
 
+                headers = {
+                    "authorization": f"Bearer {self.approval_key}"
+                }
+                
+                import inspect
+                sig = inspect.signature(websockets.connect)
+                connect_kwargs = {"ping_interval": None, "close_timeout": 10}
+                if "additional_headers" in sig.parameters:
+                    connect_kwargs["additional_headers"] = headers
+                else:
+                    connect_kwargs["extra_headers"] = headers
+
                 logger.info(f"[WS] {self.market} 웹소켓 연결 시도 중... (URL: {self.ws_url})")
-                async with websockets.connect(self.ws_url, ping_interval=None, close_timeout=10) as websocket:
+                async with websockets.connect(self.ws_url, **connect_kwargs) as websocket:
                     self._websocket = websocket
                     self.is_subscribed_prices = False # 실시간 시세 구독 여부 플래그 초기화
                     connection_start_time = time.time()
@@ -193,8 +234,13 @@ class KisWebSocketClient:
                     # 클라이언트 주도 PING 루프 시작 (키움 규격에 맞춤)
                     self.ping_task = asyncio.create_task(self._ping_loop(websocket))
                     
-                    # 체결 통보 구독 요청 (로그인 인증)
-                    await self.subscribe(websocket)
+                    # 로그인 인증 요청 전송 (LOGIN)
+                    login_data = {
+                        "trnm": "LOGIN",
+                        "token": self.approval_key
+                    }
+                    await websocket.send(json.dumps(login_data))
+                    logger.info(f"[WS] {self.market} 로그인 인증 요청 전송")
 
                     # 메시지 수신 루프
                     while self.running:
@@ -345,6 +391,13 @@ class KisWebSocketClient:
                 return
 
             trnm = data.get('trnm')
+            # 서버 주도 PING에 대한 PONG Echo 처리 (R10002 오류 해결)
+            if trnm == "PING":
+                logger.debug(f"[WS] {self.market} Server PING received. Echoing back.")
+                if self._websocket:
+                    await self._websocket.send(message)
+                return
+
             # Control Message 수신 기록
             if trnm != "REAL":
                 logger.info(f"[WS] {self.market} Control Message received: {message}")
@@ -352,14 +405,22 @@ class KisWebSocketClient:
                 # 로그인 세션 불일치/부재 오류 처리 (예: return_code == 100013, 100018, 100004)
                 ret_code = data.get('return_code')
                 if ret_code in [100013, 100018, 100004, "100013", "100018", "100004"]:
-                    if self.retry_attempts >= 3:
-                        logger.warning(f"⚠️ [WS] {self.market} 로그인 인증 오류 지속 감지 ({self.retry_attempts}회). REST API 보호를 위해 토큰 강제 갱신을 억제하고 기존 토큰을 보존합니다.")
-                        self._force_token_renew = False
-                    else:
-                        logger.warning(f"⚠️ [WS] {self.market} 로그인 세션/인증 오류 감지 (코드: {ret_code}). 토큰 강제 재발급 및 재연결 준비.")
-                        self._force_token_renew = True
+                    logger.warning(f"⚠️ [WS] {self.market} 로그인 세션/인증 오류 감지 (코드: {ret_code}). 토큰을 강제 재발급하며 재연결을 대기합니다.")
+                    self._force_token_renew = True
                     if self._websocket:
                         await self._websocket.close()
+                    return
+
+                # 로그인 인증 전문(LOGIN)에 대한 결과 처리
+                if trnm == "LOGIN":
+                    if ret_code in [0, "0", "000000", None]:
+                        logger.info(f"🔑 [WS] {self.market} 로그인 인증 성공. 체결 통보 구독을 진행합니다.")
+                        asyncio.create_task(self.subscribe(self._websocket))
+                    else:
+                        logger.error(f"❌ [WS] {self.market} 로그인 인증 실패 (코드: {ret_code}, 메시지: {data.get('return_msg')}).")
+                        self._force_token_renew = True
+                        if self._websocket:
+                            await self._websocket.close()
                     return
 
                 # 로그인 인증(체결 통보 등록 완료) 성공 시 실시간 시세 구독 트리거

@@ -53,22 +53,29 @@ ORDER_TYPE_MAP = {
     "36": "VWAP (거래량가중평균)",
 }
 
-def invalidate_access_token_controlled(market: str, account_no: str):
+def invalidate_access_token_controlled(market: str, account_no: str, trade_mode: str = None):
     """
     Invalidates the access token for a given market and account,
     with a cooldown to prevent excessive invalidation.
     """
     global _last_token_invalidated_time
+    market = market.upper()
+    if not trade_mode:
+        from core.database import get_trade_mode
+        trade_mode = get_trade_mode()
+    trade_mode = trade_mode.upper()
+
     with _token_invalidation_lock:
         now = time.time()
-        # Prevent invalidation more often than once every 5 seconds per market
-        if market in _last_token_invalidated_time and (now - _last_token_invalidated_time[market]) < 5:
+        # Prevent invalidation more often than once every 5 seconds per market & mode
+        invalidation_key = (market, trade_mode)
+        if invalidation_key in _last_token_invalidated_time and (now - _last_token_invalidated_time[invalidation_key]) < 5:
             return
-        delete_api_token_db(account_no)
-        _last_token_invalidated_time[market] = now
+        delete_api_token_db(account_no, market, trade_mode)
+        _last_token_invalidated_time[invalidation_key] = now
 
-def get_access_token(market: str = "US", force: bool = False) -> str:
-    global _last_token_fail_times
+def get_access_token(market: str = "US", force: bool = False, trade_mode: str = None) -> str:
+    global _last_token_fail_times, _token_fail_count
     market = market.upper()
 
     # 1. 공통 환경 변수(.env) 로드
@@ -84,8 +91,10 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
         env_config.update(dotenv_values(market_env_path))
 
     # 3. 거래 모드(REAL vs MOCK) 판별 및 변수 설정
-    from core.database import get_trade_mode
-    trade_mode = get_trade_mode()
+    if not trade_mode:
+        from core.database import get_trade_mode
+        trade_mode = get_trade_mode()
+    trade_mode = trade_mode.upper()
 
     if trade_mode == "MOCK":
         prefix = "MOCKKR_" if market == "KR" else "MOCKUS_"
@@ -100,11 +109,12 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
         account_no = str(env_config.get("KIWOOM_ACCOUNT_NO", "")).strip()
     
     if not account_no:
-        logger.error(f"[{market}] KIWOOM_ACCOUNT_NO 환경 변수가 설정되지 않았습니다. 토큰 발급 불가.")
+        logger.error(f"[{market}] 계좌번호 (mode: {trade_mode})가 설정되지 않았습니다. 토큰 발급 불가.")
         return ""
 
-    if account_no not in _token_fail_count:
-        _token_fail_count[account_no] = 0
+    token_key = (account_no, market, trade_mode)
+    if token_key not in _token_fail_count:
+        _token_fail_count[token_key] = 0
 
     now = time.time()
 
@@ -112,7 +122,7 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
     db_token = None
     db_expires_at = 0
     if not force:
-        db_token_info = load_api_token_db(account_no)
+        db_token_info = load_api_token_db(account_no, market, trade_mode)
         if db_token_info:
             db_token = db_token_info.get("token")
             db_expires_at = db_token_info.get("expires_at", 0)
@@ -121,18 +131,18 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
             if db_token and now < db_expires_at - 60:
                 return db_token
             else:
-                logger.info(f"[{market}] DB 토큰 만료 또는 만료 임박. 재발급 시도.")
-                _token_fail_count[account_no] = 0 # 만료된 토큰이라도 DB에 있었으면 실패 카운트 초기화
+                logger.info(f"[{market}] DB 토큰 만료 또는 만료 임박. 재발급 시도 (mode: {trade_mode}).")
+                _token_fail_count[token_key] = 0 # 만료된 토큰이라도 DB에 있었으면 실패 카운트 초기화
         else:
-            logger.info(f"[{market}] DB에 저장된 토큰 없음. 신규 발급 시도.")
+            logger.info(f"[{market}] DB에 저장된 토큰 없음. 신규 발급 시도 (mode: {trade_mode}).")
     else:
-        logger.info(f"[{market}] 토큰 재발급 강제 요청됨. 신규 발급 시도.")
+        logger.info(f"[{market}] 토큰 재발급 강제 요청됨. 신규 발급 시도 (mode: {trade_mode}).")
 
     # 2. API 호출하여 신규 발급 (Lock을 통해 단일 스레드만 접근 허용)
     with _token_fetch_lock:
         if not force:
             # Lock을 얻은 후 다시 한번 DB 확인 (다른 스레드가 이미 업데이트했을 수 있음)
-            db_token_info = load_api_token_db(account_no)
+            db_token_info = load_api_token_db(account_no, market, trade_mode)
             if db_token_info:
                 db_token = db_token_info.get("token")
                 db_expires_at = db_token_info.get("expires_at", 0)
@@ -141,8 +151,8 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
                     return db_token
 
         # 쿨다운 확인
-        if account_no in _last_token_fail_times and _last_token_fail_times[account_no] != 0 and now - _last_token_fail_times[account_no] < 60:
-            logger.debug(f"[{market}] 계좌 {account_no}의 토큰 발급이 쿨다운 중입니다. 기존 토큰 반환 시도.")
+        if token_key in _last_token_fail_times and _last_token_fail_times[token_key] != 0 and now - _last_token_fail_times[token_key] < 60:
+            logger.debug(f"[{market}] 계좌 {account_no} (mode: {trade_mode})의 토큰 발급이 쿨다운 중입니다. 기존 토큰 반환 시도.")
             return db_token if db_token and now < db_expires_at - 10 else ""
 
         # 3. Kiwoom API 호출
@@ -158,7 +168,7 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
         }
         
         try:
-            logger.info(f"[{market}] 키움 서버로부터 새로운 토큰 발급을 시도합니다.")
+            logger.info(f"[{market}] 키움 서버로부터 새로운 토큰 발급을 시도합니다 (mode: {trade_mode}).")
             r = requests.post(url, headers=headers, data=json.dumps(body), verify=False)
             r.raise_for_status()
             data = r.json()
@@ -172,43 +182,53 @@ def get_access_token(market: str = "US", force: bool = False) -> str:
             expires_dt_obj = local_tz.localize(expires_dt_obj)
             expires_at = expires_dt_obj.timestamp()
             
-            save_api_token_db(account_no, market, token, expires_at, now)
+            save_api_token_db(account_no, market, trade_mode, token, expires_at, now)
             
-            logger.info(f"[{market}] 새로운 Access Token 발급 성공 (만료: {datetime.fromtimestamp(expires_at)})")
-            _last_token_fail_times[account_no] = 0
-            _token_fail_count[account_no] = 0
+            logger.info(f"[{market}] 새로운 Access Token 발급 성공 (만료: {datetime.fromtimestamp(expires_at)}, mode: {trade_mode})")
+            _last_token_fail_times[token_key] = 0
+            _token_fail_count[token_key] = 0
             return token
         except requests.exceptions.HTTPError as e:
-            _token_fail_count[account_no] += 1
+            _token_fail_count[token_key] += 1
             error_body = e.response.json() if e.response is not None and e.response.text else {}
             logger.error(f"[{market}] API Token HTTP Error: {e.response.text if e.response else e}")
+            _last_token_fail_times[token_key] = now
             if db_token and now < db_expires_at - 10:
                 logger.warning(f"[{market}] 신규 토큰 발급 실패. 기존 토큰으로 가동을 유지합니다.")
                 return db_token
             return ""
         except Exception as e:
             logger.error(f"[{market}] API Token Error: {e}")
-        _last_token_fail_times[market] = now
-        return ""
+            _last_token_fail_times[token_key] = now
+            return ""
 
-def clear_access_token(market: str = "US", account_no: str = None):
+def clear_access_token(market: str = "US", account_no: str = None, trade_mode: str = None):
     global _token_fail_count
 
     """토큰 캐시 삭제 (DB에서 삭제)"""
     market = market.upper()
-    logger.debug(f"[{market}] clear_access_token invoked.")
+    if not trade_mode:
+        from core.database import get_trade_mode
+        trade_mode = get_trade_mode()
+    trade_mode = trade_mode.upper()
+    logger.debug(f"[{market}] clear_access_token invoked (mode: {trade_mode}).")
     
     if account_no is None:
         env_suffix = "kr" if market == "KR" else "us"
         env_path = os.path.join(PROJECT_ROOT, "env", f".env.{env_suffix}")
         env_config = dotenv_values(env_path)
-        account_no = str(env_config.get("KIWOOM_ACCOUNT_NO", "")).strip()
+        if trade_mode == "MOCK":
+            prefix = "MOCKKR_" if market == "KR" else "MOCKUS_"
+            account_no = str(env_config.get(f"{prefix}ACCOUNT_NO", "")).strip()
+        else:
+            account_no = str(env_config.get("KIWOOM_ACCOUNT_NO", "")).strip()
 
     if account_no:
-        if account_no in _token_fail_count:
-            _token_fail_count[account_no] = 0 # 명시적 토큰 삭제 시 실패 카운트 초기화
+        token_key = (account_no, market, trade_mode)
+        if token_key in _token_fail_count:
+            _token_fail_count[token_key] = 0 # 명시적 토큰 삭제 시 실패 카운트 초기화
             
-        delete_api_token_db(account_no)
+        delete_api_token_db(account_no, market, trade_mode)
     else:
         logger.error(f"[{market}] 토큰 삭제 실패: 계좌번호를 찾을 수 없습니다.")
 
@@ -564,8 +584,8 @@ class Broker:
             # 매도 시 보수적으로 내림
             return math.floor(price * 100) / 100.0
 
-def kis_headers(tr_id: str, market: str = "US", custtype: str = "P") -> dict:
-    token = get_access_token(market)
+def kis_headers(tr_id: str, market: str = "US", custtype: str = "P", trade_mode: str = None) -> dict:
+    token = get_access_token(market, trade_mode=trade_mode)
     if not token:
         return {} # 토큰이 없으면 빈 헤더 반환하여 호출 단계에서 실패하도록 함
 

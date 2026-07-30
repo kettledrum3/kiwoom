@@ -67,6 +67,14 @@ class StreamlitLogHandler(logging.Handler):
 
 setup_logging()
 
+def safe_float(val, default=0.0):
+    try:
+        if val is None or str(val).strip() == "":
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # --- 모듈 임포트 (데이터베이스 관련 임포트를 호출부 위로 이동) ---
 from core.database import (
     get_all_states_db, save_state_db, get_detailed_trade_history_db, migrate_sync_trades_db, get_order_history_db, sync_open_orders_db,
@@ -105,13 +113,21 @@ if "pending_strat_update" not in st.session_state:
 st.session_state.auth_trace.append(f"Run started at {datetime.now().strftime('%H:%M:%S')}")
 
 # --- [FIX] 위젯이 렌더링되기 전에 대기 중인 UI 업데이트 프로세싱 ---
+t_mode_val = get_trade_mode().lower()
+
 if st.session_state.pending_market_selector_update is not None:
     st.session_state["market_selector"] = st.session_state.pending_market_selector_update
     st.session_state.pending_market_selector_update = None
 
+if st.session_state.pending_strat_update is not None:
+    p = st.session_state.pending_strat_update
+    m_key = f"{t_mode_val}_{p['m_code'].lower()}_strat"
+    st.session_state[m_key] = p['strat']
+    st.session_state.pending_strat_update = None
+
 if st.session_state.pending_symbol_update is not None:
     p = st.session_state.pending_symbol_update
-    m_key = f"{p['m_code'].lower()}_{p['strat'].lower()}_symbol_sel"
+    m_key = f"{t_mode_val}_{p['m_code'].lower()}_{p['strat'].lower()}_symbol_sel"
     st.session_state[m_key] = p['symbol']
     slot_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
     if slot_key not in st.session_state:
@@ -121,19 +137,13 @@ if st.session_state.pending_symbol_update is not None:
 
 if st.session_state.pending_alias_update is not None:
     p = st.session_state.pending_alias_update
-    m_key = f"{p['m_code'].lower()}_{p['strat'].lower()}_alias_sel"
+    m_key = f"{t_mode_val}_{p['m_code'].lower()}_{p['strat'].lower()}_alias_sel"
     st.session_state[m_key] = p['alias']
     slot_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
     if slot_key not in st.session_state:
         st.session_state[slot_key] = {}
-    st.session_key = f"target_{p['m_code'].lower()}_{p['strat'].lower()}"
     st.session_state[slot_key]['alias'] = p['alias']
     st.session_state.pending_alias_update = None
-
-if st.session_state.pending_strat_update is not None:
-    m_key = f"{st.session_state.pending_strat_update['m_code'].lower()}_strat"
-    st.session_state[m_key] = st.session_state.pending_strat_update['strat']
-    st.session_state.pending_strat_update = None
 
 # 자동 로그아웃 체크 (1시간 = 3600초)
 if st.session_state.authenticated:
@@ -1996,9 +2006,9 @@ if mode == "실전 투자":
                     df_orders['주문유형'] = df_orders['type'].map(lambda x: ORDER_TYPE_MAP.get(x, x))
                     # 가격 컬럼을 소수점 4자리 문자열로 변환하여 확인 가능하게 함
                     if market_code == "KR":
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(float(x)):,}" if x is not None and str(x).strip() != "" else "0")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(safe_float(x)):,}")
                     else:
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{float(x):.4f}" if x is not None and str(x).strip() != "" else "0.0000")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{safe_float(x):.4f}")
                     df_orders = df_orders.rename(columns={'strategy_name': '별칭'}) # Rename strategy_name to 별칭
                     disp_cols = ['timestamp', 'symbol', '별칭', 'side', '가격', 'qty', '주문유형', 'status', 'odno']
                     df_orders = df_orders[disp_cols].rename(columns={'timestamp': '시간', 'symbol': 'Ticker', 'side': '구분', 'qty': '수량'})
@@ -2286,9 +2296,9 @@ if mode == "실전 투자":
                     df_orders['주문유형'] = df_orders['type'].map(lambda x: ORDER_TYPE_MAP.get(x, x))
                     # 가격 컬럼을 소수점 4자리 문자열로 변환하여 확인 가능하게 함
                     if market_code == "KR":
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(float(x)):,}" if x is not None and str(x).strip() != "" else "0")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{int(safe_float(x)):,}")
                     else:
-                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{float(x):.4f}" if x is not None and str(x).strip() != "" else "0.0000")
+                        df_orders['가격'] = df_orders['price'].map(lambda x: f"{safe_float(x):.4f}")
                     df_orders = df_orders.rename(columns={'strategy_name': '별칭'}) # Rename strategy_name to 별칭
                     disp_cols = ['timestamp', 'symbol', '별칭', 'side', '가격', 'qty', '주문유형', 'status', 'odno']
                     df_orders = df_orders[disp_cols].rename(columns={'timestamp': '시간', 'symbol': 'Ticker', 'side': '구분', 'qty': '수량'})

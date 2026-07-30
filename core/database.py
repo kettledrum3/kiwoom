@@ -230,15 +230,23 @@ def init_db(run_maintenance=False):
         )
     ''')
 
-    # API 토큰 관리 테이블 추가
+    # API 토큰 관리 테이블 추가 (Migration 포함)
+    cursor.execute("PRAGMA table_info(api_tokens)")
+    api_token_cols = [col[1] for col in cursor.fetchall()]
+    if api_token_cols and "trade_mode" not in api_token_cols:
+        logger.info("🛠️ [Migration] api_tokens 테이블을 새로운 스키마로 변경하기 위해 재생성합니다.")
+        cursor.execute("DROP TABLE api_tokens")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS api_tokens (
-            account_no TEXT PRIMARY KEY,
+            account_no TEXT,
             market TEXT,
+            trade_mode TEXT,
             token TEXT,
             expires_at REAL,
             issued_at REAL,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (account_no, market, trade_mode)
         )
     ''')
 
@@ -307,6 +315,40 @@ def init_db(run_maintenance=False):
         cursor.execute("ALTER TABLE user_auth ADD COLUMN is_temp_password INTEGER DEFAULT 0")
     if 'failed_attempts' not in ua_cols:
         cursor.execute("ALTER TABLE user_auth ADD COLUMN failed_attempts INTEGER DEFAULT 0")
+
+    # [Migration] order_history 테이블의 컬럼 시프트 오류 복구 (self-healing)
+    try:
+        cursor.execute("SELECT id, side, price, qty, type, status, odno, msg, market FROM order_history WHERE price IN ('BUY', 'SELL')")
+        shifted_rows = cursor.fetchall()
+        if shifted_rows:
+            logger.info(f"🛠️ [Migration] order_history 테이블에서 {len(shifted_rows)}개의 컬럼 시프트 오류 데이터 복구를 시도합니다.")
+            for row in shifted_rows:
+                row_id, side, price, qty, otype, status, odno, msg, market = row
+                # 복구 매핑
+                correct_side = price
+                try:
+                    correct_price = float(qty) if qty is not None else 0.0
+                except ValueError:
+                    correct_price = 0.0
+                try:
+                    correct_qty = float(otype) if otype is not None else 0.0
+                except ValueError:
+                    correct_qty = 0.0
+                    
+                correct_type = status
+                correct_status = odno
+                correct_odno = msg
+                correct_msg = market
+                correct_market = side if side in ['US', 'KR'] else 'US'
+                
+                cursor.execute('''
+                    UPDATE order_history 
+                    SET side=?, price=?, qty=?, type=?, status=?, odno=?, msg=?, market=?
+                    WHERE id=?
+                ''', (correct_side, correct_price, correct_qty, correct_type, correct_status, correct_odno, correct_msg, correct_market, row_id))
+            logger.info("✅ [Migration] order_history 컬럼 시프트 오류 데이터 복구 완료.")
+    except Exception as e:
+        logger.warning(f"⚠️ [Migration] order_history 데이터 복구 중 오류 발생 (무시 가능): {e}")
 
     conn.commit()
     conn.close()
@@ -1305,53 +1347,53 @@ def get_canceled_orders_db(market: str):
         logger.error(f"Failed to get canceled orders: {e}")
         return [], []
 
-def save_api_token_db(account_no: str, market: str, token: str, expires_at: float, issued_at: float):
+def save_api_token_db(account_no: str, market: str, trade_mode: str, token: str, expires_at: float, issued_at: float):
     """API 토큰 정보를 DB에 저장 또는 업데이트"""
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO api_tokens (account_no, market, token, expires_at, issued_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (account_no, market, token, expires_at, issued_at))
+            INSERT OR REPLACE INTO api_tokens (account_no, market, trade_mode, token, expires_at, issued_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (account_no, market.upper(), trade_mode.upper(), token, expires_at, issued_at))
         conn.commit()
         conn.close()
-        logger.debug(f"✅ API 토큰 DB 저장/업데이트 완료: 계좌 {account_no}, 시장 {market}")
+        logger.debug(f"✅ API 토큰 DB 저장/업데이트 완료: 계좌 {account_no}, 시장 {market}, 모드 {trade_mode}")
     except Exception as e:
         logger.error(f"API 토큰 DB 저장 실패: {e}")
 
-def load_api_token_db(account_no: str) -> dict:
+def load_api_token_db(account_no: str, market: str, trade_mode: str) -> dict:
     """
-    DB에서 특정 계좌번호에 해당하는 API 토큰 정보를 로드합니다.
-    단일 계좌에 단일 토큰을 가정하므로 market 필터링 없이 account_no로만 조회합니다.
+    DB에서 특정 계좌번호, 시장, 거래 모드에 해당하는 API 토큰 정보를 로드합니다.
     """
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT market, token, expires_at, issued_at FROM api_tokens WHERE account_no=?', (account_no,))
+        cursor.execute('SELECT token, expires_at, issued_at FROM api_tokens WHERE account_no=? AND market=? AND trade_mode=?', (account_no, market.upper(), trade_mode.upper()))
         row = cursor.fetchone()
         conn.close()
         if row:
             return {
-                "market": row[0],
-                "token": row[1],
-                "expires_at": row[2],
-                "issued_at": row[3]
+                "market": market.upper(),
+                "trade_mode": trade_mode.upper(),
+                "token": row[0],
+                "expires_at": row[1],
+                "issued_at": row[2]
             }
         return {}
     except Exception as e:
         logger.error(f"API 토큰 DB 로드 실패: {e}")
         return {}
 
-def delete_api_token_db(account_no: str):
-    """DB에서 특정 계좌의 토큰 정보를 삭제합니다."""
+def delete_api_token_db(account_no: str, market: str, trade_mode: str):
+    """DB에서 특정 계좌, 시장, 거래 모드의 토큰 정보를 삭제합니다."""
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM api_tokens WHERE account_no=?', (account_no,))
+        cursor.execute('DELETE FROM api_tokens WHERE account_no=? AND market=? AND trade_mode=?', (account_no, market.upper(), trade_mode.upper()))
         conn.commit()
         conn.close()
-        logger.info(f"🗑️ API 토큰 DB 삭제 완료 (계좌: {account_no})")
+        logger.info(f"🗑️ API 토큰 DB 삭제 완료 (계좌: {account_no}, 시장: {market}, 모드: {trade_mode})")
     except Exception as e:
         logger.error(f"API 토큰 DB 삭제 실패: {e}")
 
