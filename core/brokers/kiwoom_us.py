@@ -63,6 +63,7 @@ class KiwoomUsBroker(Broker):
         return self.exchange_map.get(symbol.upper(), "ND")
 
     def _call_api(self, method, url, tr_id, params=None, data=None, extra_headers=None):
+        res = None
         max_retries = 3
         for attempt in range(max_retries):
             headers = kis_headers(tr_id, market="US", trade_mode=self.trade_mode)

@@ -61,9 +61,11 @@ class KisWebSocketClient:
             prefix = "MOCKKR_" if self.market == "KR" else "MOCKUS_"
             self.hts_id = os.getenv(f"{prefix}CLIENT_ID", "").strip()
             self.ws_url = os.getenv("MOCK_SOCKET_URL", "wss://mockapi.kiwoom.com:10000").strip()
+            self.account_no = os.getenv(f"{prefix}ACCOUNT_NO", "").strip()
         else:
             self.hts_id = os.getenv("KIWOOM_CLIENT_ID", "").strip()
             self.ws_url = os.getenv("KIWOOM_SOCKET_URL", "wss://api.kiwoom.com:10000").strip()
+            self.account_no = os.getenv("KIWOOM_ACCOUNT_NO", "").strip()
 
         # 웹소켓 URI 경로 자동 추가
         ws_path = "/api/dostk/websocket" if self.market == "KR" else "/api/us/websocket"
@@ -108,9 +110,11 @@ class KisWebSocketClient:
                     prefix = "MOCKKR_" if self.market == "KR" else "MOCKUS_"
                     self.hts_id = os.getenv(f"{prefix}CLIENT_ID", "").strip()
                     self.ws_url = os.getenv("MOCK_SOCKET_URL", "wss://mockapi.kiwoom.com:10000").strip()
+                    self.account_no = os.getenv(f"{prefix}ACCOUNT_NO", "").strip()
                 else:
                     self.hts_id = os.getenv("KIWOOM_CLIENT_ID", "").strip()
                     self.ws_url = os.getenv("KIWOOM_SOCKET_URL", "wss://api.kiwoom.com:10000").strip()
+                    self.account_no = os.getenv("KIWOOM_ACCOUNT_NO", "").strip()
 
                 ws_path = "/api/dostk/websocket" if self.market == "KR" else "/api/us/websocket"
                 if not self.ws_url.endswith(ws_path):
@@ -245,6 +249,34 @@ class KisWebSocketClient:
                     # 메시지 수신 루프
                     while self.running:
                         try:
+                            # 거래 모드 및 계좌 번호 동적 변경 체크
+                            from core.database import get_trade_mode
+                            current_mode = get_trade_mode()
+                            
+                            # 환경 변수 재로드 후 계좌 번호 확인
+                            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                            env_suffix = "kr" if self.market == "KR" else "us"
+                            env_path = os.path.join(project_root, "env", f".env.{env_suffix}")
+                            if os.path.exists(env_path):
+                                from dotenv import load_dotenv
+                                load_dotenv(env_path, override=True)
+                                
+                            if current_mode == "MOCK":
+                                prefix = "MOCKKR_" if self.market == "KR" else "MOCKUS_"
+                                current_account = os.getenv(f"{prefix}ACCOUNT_NO", "").strip()
+                            else:
+                                current_account = os.getenv("KIWOOM_ACCOUNT_NO", "").strip()
+                                
+                            if current_mode != self.trade_mode or current_account != self.account_no:
+                                logger.info(
+                                    f"🔄 [WS] {self.market} 거래 모드 또는 계좌 번호 변경 감지 "
+                                    f"(Mode: {self.trade_mode} -> {current_mode}, Account: {self.account_no} -> {current_account}). "
+                                    f"웹소켓 연결을 종료하고 재접속합니다."
+                                )
+                                self.trade_mode = current_mode
+                                self.account_no = current_account
+                                break
+
                             now_time = datetime.now(market_tz).time()
                             if not (open_time <= now_time <= close_time):
                                 logger.info(f"⏰ [WS] {self.market} 정규장 운영 시간 종료. 연결을 해제합니다.")
@@ -295,7 +327,13 @@ class KisWebSocketClient:
         try:
             while self.running:
                 await asyncio.sleep(120)  # 2분 간격
-                is_open = websocket.open if hasattr(websocket, 'open') else not websocket.closed
+                is_open = False
+                if hasattr(websocket, 'open'):
+                    is_open = websocket.open
+                elif hasattr(websocket, 'closed'):
+                    is_open = not websocket.closed
+                else:
+                    is_open = True
                 if is_open:
                     ping_msg = {
                         "header": {
@@ -340,8 +378,9 @@ class KisWebSocketClient:
                 "- type": api_id
             }
         }
-        await websocket.send(json.dumps(data))
-        logger.info(f"[WS] {self.market} 체결 통보 구독 요청 전송 (api-id: {api_id}, item: {item_val})")
+        send_data = json.dumps(data)
+        logger.info(f"[WS] {self.market} 체결 통보 구독 요청 전송 전문: {send_data}")
+        await websocket.send(send_data)
 
     async def subscribe_prices(self, websocket):
         """실시간 시세 구독 요청 (0B 또는 FE)"""
@@ -375,8 +414,9 @@ class KisWebSocketClient:
                     "- type": api_id
                 }
             }
-            await websocket.send(json.dumps(data))
-            logger.info(f"[WS] {self.market} {symbol} 실시간 시세 구독 시작")
+            send_data = json.dumps(data)
+            logger.info(f"[WS] {self.market} {symbol} 실시간 시세 구독 요청 전송 전문: {send_data}")
+            await websocket.send(send_data)
             await asyncio.sleep(0.1)
 
     async def on_message(self, message):
@@ -427,6 +467,12 @@ class KisWebSocketClient:
                 msg_api_id = header.get('api-id')
                 target_api_id = "00" if self.market == "KR" else "F5"
                 if trnm == "REG" and (msg_api_id == target_api_id or msg_api_id is None):
+                    if ret_code in [105101, "105101"]:
+                        logger.warning(
+                            f"❌ [WS] {self.market} 구독 실패 (105101: 전문 변환 실패). "
+                            f"보낸 구독 전문의 규격이나 타입 설정을 다시 확인해야 합니다. 수신 전문: {message}"
+                        )
+                    
                     if ret_code in [0, "0", "000000", None] and not self.is_subscribed_prices:
                         logger.info(f"🔑 [WS] {self.market} 로그인 인증(체결 통보 등록) 확인 성공. 실시간 시세 구독을 진행합니다.")
                         self.is_subscribed_prices = True

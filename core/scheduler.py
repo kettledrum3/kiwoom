@@ -657,7 +657,7 @@ def job_monitor_deposits():
                 for m in active_markets:
                     req_str = f"₩{market_min_required[m]:,.0f}" if m == "KR" else f"${market_min_required[m]:,.2f}"
                     cash_str = f"₩{market_cash[m]:,.0f}" if m == "KR" else f"${market_cash[m]:,.2f}"
-                    msg += f"- {m} 시장: 보유 {cash_str} < 최소필요 {req_str}\n"
+                    msg += f"- {m} 시장: 보유 {cash_str} (최소 필요 {req_str})\n"
                 msg += "예수금이 확보되면 자동으로 재개됩니다."
                 logger.warning(msg.replace("<b>", "").replace("</b>", "").replace("<br>", "\n"))
                 send_telegram_message(msg)

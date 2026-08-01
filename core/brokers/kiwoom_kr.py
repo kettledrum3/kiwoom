@@ -59,6 +59,7 @@ class KiwoomKrBroker(Broker):
         self.etf_tickers = self._load_etf_list()
 
     def _call_api(self, method, url, tr_id, params=None, data=None, extra_headers=None):
+        res = None
         max_retries = 3
         for attempt in range(max_retries):
             # KIS 헤더 함수를 호출하여 키움 REST 헤더(api-id, authorization)를 생성함
