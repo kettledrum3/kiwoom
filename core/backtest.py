@@ -71,6 +71,16 @@ class BacktestBroker(Broker):
     def get_price(self, symbol: str) -> float:
         return self._get_current_close()
     
+    def get_previous_close(self, symbol: str) -> float:
+        """직전 거래일 종가 반환 (백테스트 시뮬레이션용)"""
+        if self.current_idx > 0:
+            return float(self.df.iloc[self.current_idx - 1]['Close'])
+        else:
+            row = self.df.iloc[self.current_idx]
+            if 'Open' in row:
+                return float(row['Open'])
+            return float(row['Close'])
+    
     def get_current_high(self, symbol: str = None) -> float:
         """현재 캔들의 고가 반환 (VR 매도 조건 체크용)"""
         return float(self.df.iloc[self.current_idx]['High'])

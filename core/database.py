@@ -1157,7 +1157,8 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                             new_total_qty = max(0, old_qty - qty)
                             new_avg = old_avg if new_total_qty > 0 else 0.0
                             
-                            if new_total_qty == 0:
+                            # [FIX] 기존 보유 수량(old_qty)이 0보다 큰 상태에서 전량 매도되어 0이 된 경우에만 차수 전환 대기 상태로 변경
+                            if old_qty > 0 and new_total_qty == 0:
                                 state_dict['pending_cycle_transition'] = True
                                 logger.info(f"🚩 [Sync] {symbol} 전량 매도 확인됨. 차수 전환 대기 상태로 변경.")
                         

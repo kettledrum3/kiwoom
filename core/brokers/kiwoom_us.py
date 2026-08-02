@@ -117,8 +117,8 @@ class KiwoomUsBroker(Broker):
     def _get_chart_data(self, symbol: str) -> Optional[List[dict]]:
         """usa06012 (미국주식 일 차트) API를 호출하여 일봉 데이터 리스트를 가져옵니다."""
         url = f"{self.base_url}/api/us/chart"
-        # 시작일자를 오늘로부터 15일 전으로 세팅하여 충분한 데이터를 확보함
-        start_date = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+        # 시작일자를 오늘 날짜로 설정하여 최신 데이터를 확보함
+        start_date = datetime.now().strftime("%Y%m%d")
         body = {
             "stex_tp": self._get_exchange(symbol),
             "stk_cd": symbol,
@@ -456,11 +456,18 @@ class KiwoomUsBroker(Broker):
         url = f"{self.base_url}/api/us/chart"
         all_rows = []
         next_key = ""
-        start_date = (datetime.now() - timedelta(days=450)).strftime("%Y%m%d")
+        # 시작일자를 오늘 날짜로 설정하여 오늘부터 과거로 데이터를 수집함
+        start_date = datetime.now().strftime("%Y%m%d")
         
-        for _ in range(5):
+        # [FIX] days 기간에 따라 연속 조회(Pagination) 루프 횟수를 동적으로 계산
+        max_loops = max(5, (days // 15) + 2)
+        
+        for _ in range(max_loops):
             if len(all_rows) >= days:
                 break
+                
+            # [ADD] 과도한 API 호출로 인한 서버 차단 방지용 짧은 딜레이 추가
+            time.sleep(1.0)
                 
             body = {
                 "stex_tp": self._get_exchange(symbol),

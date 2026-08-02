@@ -461,11 +461,14 @@ def display_scheduler_control():
 # 사이드바 상태 요약 표시 함수
 def display_sidebar_summary(m_display, m_code):
     st.sidebar.markdown("---")
-    st.sidebar.subheader(f"📊 {m_display} 실전 투자 현황 (전략별)")
+    st.sidebar.subheader(f"📊 {m_display} 투자 현황 (전략별)")
     
-    # DB에서 모든 전략 상태 로드 (선택된 시장에 맞춰)
-    states_ca = get_all_states_db("CA", market=m_code)
-    states_vr = get_all_states_db("VR", market=m_code)
+    # 현재 활성화된 거래 모드 (REAL 또는 MOCK) 가져오기
+    t_mode = get_trade_mode()
+    
+    # DB에서 현재 거래 모드(MOCK/REAL)에 맞는 활성 전략 상태만 로드하여 백테스트를 요약에서 제외
+    states_ca = get_all_states_db("CA", market=m_code, trade_mode=t_mode)
+    states_vr = get_all_states_db("VR", market=m_code, trade_mode=t_mode)
     states = states_ca + states_vr
     
     if not states:
@@ -772,7 +775,6 @@ with st.sidebar:
         if s_choice == "CA":
             # [CA 전용] 전략 할당 예수금만 표시
             def_pool = d_state.get('pool', 0.0) if d_state else 0.0
-            widget_suffix = f"{s_symbol}_{s_alias}"
             s_pool = st.number_input(f"전략 할당 예수금 ({m_curr})", value=float(def_pool), key=f"{m_lower}_{widget_suffix}_pool", help="이 전략에서 사용할 현금 한도입니다.")
 
             def_ub = d_state.get('unit_buy_amount', 250.0) if d_state else 250.0
@@ -796,7 +798,6 @@ with st.sidebar:
             # [VR 전용] 운용 자본금만 표시 (예수금은 내부 상태 유지)
             def_budget = d_state.get('initial_budget', 10000.0) if d_state else 10000.0
             def_pool = d_state.get('pool', 0.0) if d_state else 0.0
-            widget_suffix = f"{s_symbol}_{s_alias}"
             i_cash = st.number_input(f"운용 자본금 ({m_curr})", value=float(def_budget), key=f"{m_lower}_{widget_suffix}_budget", help="밸류리밸런싱 운용 자본금(VR용).")
 
             def_pa = d_state.get('periodic_accumulation', 250.0) if d_state else 250.0
@@ -1021,6 +1022,14 @@ if st.sidebar.button("🔓 로그아웃"):
 
 display_mode = "모의 투자" if (current_trade_mode == "MOCK" and mode == "실전 투자") else mode
 st.title(f"🚀 {display_mode} - {strategy_choice} 전략")
+
+# [ADD] 현재 활성화된 모드에 대한 명확한 한글 설명 제공
+if display_mode == "실전 투자":
+    st.info(f"💼 **[실전 투자 모드]** 실제 키움증권 계좌(계좌번호: `{ActiveBroker.account_no}`)를 연동하여 실제 매매를 진행합니다. 신중히 결정해 주세요.")
+elif display_mode == "모의 투자":
+    st.success(f"📈 **[모의 투자 모드]** 키움증권 모의 계좌(계좌번호: `{ActiveBroker.account_no}`)를 연동하여 가상의 잔고로 안전한 시뮬레이션 투자를 진행합니다.")
+elif display_mode == "백테스트":
+    st.warning(f"🧪 **[백테스트 모드]** 과거 {fetch_days}일간의 누적 데이터를 토대로 CA/VR 전략 시뮬레이션을 수행합니다. 실제 주문은 발생하지 않습니다.")
 
 # --- 시장별 현황 탭 --- (사이드바 선택에 따라 강조 및 필터링)
 # [수정] 활성 시장에 따라 탭 순서를 동적으로 변경하여 첫 번째 탭이 항상 활성 시장을 가리키도록 함
@@ -1367,6 +1376,17 @@ with tab_finished:
             sym, stype, m_code, alias, s_json, f_at = row
             cur_sym = "₩" if m_code == "KR" else "$"
             
+            # [ADD] 미국주식(US)인 경우 종료일시(UTC)를 한국 시간(KST)으로 변환하여 표시
+            display_f_at = f_at
+            if m_code == "US" and f_at:
+                try:
+                    import pytz
+                    utc_dt = datetime.strptime(f_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
+                    kst_dt = utc_dt.astimezone(pytz.timezone('Asia/Seoul'))
+                    display_f_at = kst_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            
             # 해당 전략 별칭(alias)에 해당하는 모든 매도(SELL) 거래의 실현 손익을 합산합니다.
             # r[1]: symbol, r[3]: market, r[4]: strategy_name, r[5]: side, r[14]: realized_profit
             strat_trades = [r for r in all_th_rows if r[1] == sym and r[3] == m_code and r[4] == alias]
@@ -1380,7 +1400,7 @@ with tab_finished:
             profit_info = f"수익: {cur_sym}{format_currency(realized_sum, m_code)} ({p_rate:+.2f}%)"
             
             f_data.append({
-                "종료일시": f_at, "시장": m_code, "종목": sym, "전략": stype, "별칭": alias, 
+                "종료일시": display_f_at, "시장": m_code, "종목": sym, "전략": stype, "별칭": alias, 
                 "매수원금": total_buy, "매도금액": total_sell, "실현손익": realized_sum, "수익률": p_rate,
                 "상태요약": profit_info,
                 "s_json": s_json
@@ -2420,27 +2440,66 @@ if mode == "실전 투자":
 
 elif mode == "백테스트":
     # === 백테스트 화면 ===
-    # Use session state to manage the flow
     if 'run_state' not in st.session_state:
         st.session_state.run_state = 'idle'
 
     csv_path = os.path.join("data", f"{symbol}.csv")
     file_exists = os.path.exists(csv_path)
 
+    # 1. 현재 설정 상태를 메인 영역에 요약하여 보여줌
+    st.markdown("### ⚙️ 백테스트 설정 요약")
+    
+    col_set1, col_set2 = st.columns(2)
+    with col_set1:
+        st.markdown(f"""
+        - **대상 종목**: `{symbol}`
+        - **전략 유형**: **{strategy_choice}** (`{strategy_alias}`)
+        - **데이터 기간**: `{fetch_days} 일`
+        - **초기 자본금**: `{currency_symbol}{format_currency(initial_cash, market_code)}`
+        - **백테스트 수수료**: `{fee_rate * 100:.4f} %`
+        - **매도 세금**: `{tax_rate * 100:.4f} %`
+        """)
+    with col_set2:
+        if strategy_choice == "CA":
+            st.markdown(f"""
+            - **CA 버전**: `{ca_version}`
+            - **1회 매수 금액**: `{currency_symbol}{format_currency(unit_buy, market_code)}`
+            - **목표 수익률**: `{target_profit * 100:.1f} %`
+            - **분할 횟수 (a)**: `{a_default} 회`
+            - **쿼터 손절 사용**: `{'ON' if use_quarter_stop else 'OFF'}`
+            """)
+        else: # VR
+            st.markdown(f"""
+            - **VR 투자 방식**: `{vr_invest_type_disp}`
+            - **G 값 (밸류 성장률)**: `{vr_g_value} %`
+            - **밴드 범위**: `±{vr_band_pct} %`
+            - **주기별 적립/인출액**: `{currency_symbol}{format_currency(vr_periodic_amt, market_code)}`
+            - **적립/인출 주기**: `{vr_freq}`
+            """)
+            
+    st.markdown("---")
+
+    # 2. 백테스트 실행/재실행 버튼 (st.session_state.run_state와 상관없이 항상 렌더링하여 재실행 가능하도록 변경)
+    st.markdown("### 🏁 백테스트 시뮬레이션 실행")
+    
+    if file_exists:
+        st.info(f"💾 로컬에 저장된 **'{symbol}.csv'** 파일이 존재합니다. (최근 백테스트 데이터 활용 가능)")
+    else:
+        st.warning(f"⚠️ **'{symbol}.csv'** 파일이 로컬에 존재하지 않습니다. 먼저 데이터를 수집해야 합니다.")
+
     col1, col2 = st.columns(2)
     with col1:
-        if file_exists and st.session_state.run_state == 'idle':
-            st.info(f"'{symbol}.csv' 파일 보유 중")
-            if st.button("기존 데이터로 실행", width='stretch'):
+        if file_exists:
+            if st.button("🔄 기존 데이터로 백테스트 실행", use_container_width=True, key="bt_run_existing_always"):
                 st.session_state.run_state = 'run_with_existing'
                 st.rerun()
-        elif st.session_state.run_state == 'idle':
-            if st.button("데이터 수집 및 실행", type="primary", width='stretch'):
+        else:
+            if st.button("🚀 데이터 수집 및 백테스트 실행", type="primary", use_container_width=True, key="bt_run_new_first_always"):
                 st.session_state.run_state = 'run_with_new'
                 st.rerun()
     with col2:
-        if file_exists and st.session_state.run_state == 'idle':
-            if st.button("데이터 새로 수집 후 실행", type="primary", width='stretch'):
+        if file_exists:
+            if st.button("⚡ 최신 데이터 새로 수집 후 실행", type="primary", use_container_width=True, key="bt_run_new_force_always"):
                 st.session_state.run_state = 'run_with_new'
                 st.rerun()
 

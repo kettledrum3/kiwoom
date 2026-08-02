@@ -404,9 +404,15 @@ class KiwoomKrBroker(Broker):
         next_key = ""
         base_dt = datetime.now().strftime("%Y%m%d")
         
-        for _ in range(5):
+        # [FIX] days 기간에 따라 연속 조회(Pagination) 루프 횟수를 동적으로 계산
+        max_loops = max(5, (days // 15) + 2)
+        
+        for _ in range(max_loops):
             if len(all_rows) >= days:
                 break
+                
+            # [ADD] 과도한 API 호출로 인한 서버 차단 방지용 짧은 딜레이 추가
+            time.sleep(1.0)
                 
             body = {
                 "stk_cd": symbol,
