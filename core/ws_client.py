@@ -359,26 +359,23 @@ class KisWebSocketClient:
         
         # 미국 시장(F5)인 경우, 규격상 리스트 내 맵 구조 문자열을 사용해야 파싱 실패 및 100013 에러를 예방할 수 있음
         if self.market == "US":
-            item_val = '[{"jmcode":"TQQQ","stex_tp":"ND"}]'
+            items = [{"jmcode": "TQQQ", "stex_tp": "ND"}]
+            item_list = [json.dumps(items)]
         else:
-            item_val = ""
+            item_list = [""]
             
-        data = {
+        payload = {
             "trnm": "REG",
-            "header": {
-                "api-id": api_id,
-                "authorization": f"Bearer {self.approval_key}"
-            },
-            "body": {
-                "trnm": "REG",
-                "grp_no": "1",
-                "refresh": "1",
-                "data": None,
-                "- item": item_val,
-                "- type": api_id
-            }
+            "grp_no": "1",
+            "refresh": "1",
+            "data": [
+                {
+                    "item": item_list,
+                    "type": [api_id]
+                }
+            ]
         }
-        send_data = json.dumps(data)
+        send_data = json.dumps(payload)
         logger.info(f"[WS] {self.market} 체결 통보 구독 요청 전송 전문: {send_data}")
         await websocket.send(send_data)
 
@@ -399,22 +396,26 @@ class KisWebSocketClient:
             logger.info(f"[WS] 설정된 활성 전략이 없습니다. 기본 종목을 구독합니다: {active_symbols}")
         
         for symbol in active_symbols:
-            data = {
+            if self.market == "US":
+                stex_tp = "ND"
+                if self._broker and hasattr(self._broker, '_get_exchange'):
+                    stex_tp = self._broker._get_exchange(symbol)
+                item_list = [json.dumps([{"jmcode": symbol, "stex_tp": stex_tp}])]
+            else:
+                item_list = [symbol]
+
+            payload = {
                 "trnm": "REG",
-                "header": {
-                    "api-id": api_id,
-                    "authorization": f"Bearer {self.approval_key}"
-                },
-                "body": {
-                    "trnm": "REG",
-                    "grp_no": "1",
-                    "refresh": "1",
-                    "data": None,
-                    "- item": symbol,
-                    "- type": api_id
-                }
+                "grp_no": "1",
+                "refresh": "1",
+                "data": [
+                    {
+                        "item": item_list,
+                        "type": [api_id]
+                    }
+                ]
             }
-            send_data = json.dumps(data)
+            send_data = json.dumps(payload)
             logger.info(f"[WS] {self.market} {symbol} 실시간 시세 구독 요청 전송 전문: {send_data}")
             await websocket.send(send_data)
             await asyncio.sleep(0.1)
