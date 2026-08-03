@@ -58,6 +58,8 @@ class KiwoomUsBroker(Broker):
         
         # 키움용 거래소 맵 (NASDAQ: ND, NYSE: NY, AMEX: NA)
         self.exchange_map = {"TQQQ": "ND", "SOXL": "NY", "SQQQ": "ND"}
+        self._chart_cache = {}
+        self._prev_close_cache = {}
 
     def _get_exchange(self, symbol: str) -> str:
         return self.exchange_map.get(symbol.upper(), "ND")
@@ -116,6 +118,14 @@ class KiwoomUsBroker(Broker):
 
     def _get_chart_data(self, symbol: str) -> Optional[List[dict]]:
         """usa06012 (미국주식 일 차트) API를 호출하여 일봉 데이터 리스트를 가져옵니다."""
+        # 1. 캐시 확인 (30초 이내 재호출 시 API 부하 방지용)
+        now_ts = time.time()
+        if symbol in self._chart_cache:
+            cache_ts, cache_data = self._chart_cache[symbol]
+            if now_ts - cache_ts < 30.0:
+                logger.debug(f"💾 [US Chart Cache Hit] {symbol} 일봉 차트 캐시 재사용")
+                return cache_data
+
         url = f"{self.base_url}/api/us/chart"
         # 시작일자를 오늘 날짜로 설정하여 최신 데이터를 확보함
         start_date = datetime.now().strftime("%Y%m%d")
@@ -129,8 +139,16 @@ class KiwoomUsBroker(Broker):
         res = self._call_api("POST", url, "usa06012", data=json.dumps(body))
         if res:
             data = res.json()
+            if data.get('return_code') == 0 and data.get('result_list'):
+                latest = data['result_list'][0]
+                logger.info(f"🔍 [US API Debug] usa06012 조회 성공 ({symbol}) - 최근영업일({latest.get('dt')}): 현재가 {latest.get('cur_prc')}$")
+            else:
+                logger.warning(f"🔍 [US API Debug] usa06012 응답 실패 ({symbol}): {data.get('return_msg')}")
             if data.get('return_code') == 0:
-                return data.get('result_list', [])
+                result = data.get('result_list', [])
+                # 캐시에 기록
+                self._chart_cache[symbol] = (now_ts, result)
+                return result
         return None
 
     def get_price(self, symbol: str) -> float:
@@ -143,20 +161,37 @@ class KiwoomUsBroker(Broker):
         return 0.0
 
     def get_previous_close(self, symbol: str) -> float:
-        chart = self._get_chart_data(symbol)
-        if chart:
-            # 첫 번째 항목이 오늘이고, 두 번째 항목이 전일일 수 있음
-            today_str = datetime.now().strftime("%Y%m%d")
-            valid_items = [item for item in chart if item.get('dt') != today_str]
-            if valid_items:
-                val = valid_items[0].get('cur_prc')
+        # 1. 메모리 캐시 확인 (오늘 날짜 기준으로 조회 기록이 있으면 API 호출 스킵)
+        today_str = datetime.now().strftime("%Y%m%d")
+        if hasattr(self, '_prev_close_cache') and symbol in self._prev_close_cache:
+            cache_date, val = self._prev_close_cache[symbol]
+            if cache_date == today_str:  # 당일(오늘) 내에는 캐시 재사용
+                return val
+
+        # 2. usa20100 (미국주식 현재가 상세) API를 이용해 단건으로 전일 종가 조회
+        url = f"{self.base_url}/api/us/mrkcond"
+        body = {
+            "stex_tp": self._get_exchange(symbol),
+            "stk_cd": symbol
+        }
+        try:
+            res = self._call_api("POST", url, "usa20100", data=json.dumps(body))
+            if res:
+                data = res.json()
+                val = data.get('base_close_pric')
                 if val is not None:
+                    logger.info(f"🔍 [US API Debug] usa20100 조회 성공 ({symbol}) - 전일종가: {val}$")
+                    float_val = float(val)
+                    # 캐시 갱신 (메모리 및 DB config)
+                    self._prev_close_cache[symbol] = (today_str, float_val)
                     try:
                         from core.database import set_config
-                        set_config(f"PREV_CLOSE_{symbol}", str(val))
+                        set_config(f"PREV_CLOSE_{symbol}", str(float_val))
                     except Exception:
                         pass
-                    return float(val)
+                    return float_val
+        except Exception as e:
+            logger.error(f"[US] usa20100 API 호출 중 예외 발생: {e}")
                     
         # API 조회 실패 시 DB에 캐싱된 전일 종가 정보 로드 복구 시도
         try:
@@ -300,18 +335,24 @@ class KiwoomUsBroker(Broker):
         """ust21070 (미국주식 원장잔고확인) API 연동"""
         url = f"{self.base_url}/api/us/acnt"
         body = {
-            "stex_tp": "",
+            "stex_tp": self._get_exchange(symbol),
             "stk_cd": symbol
         }
         try:
             res = self._call_api("POST", url, "ust21070", data=json.dumps(body))
             if not res:
+                logger.error("[US] 잔고 조회 API 응답 없음")
                 return 0.0, 0.0, 0.0
             data = res.json()
             if data.get('return_code') == 0:
-                for item in data.get('result_list', []):
+                res_list = data.get('result_list', [])
+                logger.info(f"🔍 [US API Debug] ust21070 조회 성공 - 보유 종목 수: {len(res_list)}개")
+                for item in res_list:
                     if item.get('stk_cd', '').strip().upper() == symbol.strip().upper():
+                        logger.info(f"   -> {symbol} 발견: 수량 {item.get('poss_qty')}주, 평단가 {item.get('frgn_stk_book_uv')}$, 평가금액 {item.get('evlt_amt')}$")
                         return float(item.get('poss_qty', 0)), float(item.get('frgn_stk_book_uv', 0)), float(item.get('evlt_amt', 0))
+            else:
+                logger.warning(f"🔍 [US API Debug] ust21070 응답 실패: {data.get('return_msg')}")
         except Exception as e:
             logger.error(f"[US] 잔고 조회 중 오류 발생: {e}")
         return 0.0, 0.0, 0.0
@@ -335,7 +376,7 @@ class KiwoomUsBroker(Broker):
         logger.error("[US] 예수금 조회 실패")
         return 0.0
 
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
         """
         [미국주식] 주문 전송
         price_type (frgn_trde_tp): 지정가: "00", 시장가: "03", LOC: "30" (키움증권 REST API 명세 기준)
@@ -381,12 +422,12 @@ class KiwoomUsBroker(Broker):
             if data.get('return_code') == 0:
                 odno = data.get('ord_no')
                 logger.info(f"🟢 [US 주문 성공] {strategy} {action} {symbol} {qty}주 @ {price} (주문번호: {odno})")
-                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "ORDERED", odno, "성공", market="US", strategy_name=strategy)
+                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "ORDERED", odno, "성공", market="US", strategy_name=strategy_name)
                 return True
             else:
                 msg = data.get('return_msg', '알 수 없는 오류')
                 logger.error(f"🔴 [US 주문 실패] {strategy} {action} {symbol} {qty}주 @ {price} -> {msg}")
-                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "FAILED", "", msg, market="US", strategy_name=strategy)
+                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "FAILED", "", msg, market="US", strategy_name=strategy_name)
                 send_telegram_message(f"🔴 <b>[US 주문 실패]</b>\n종목: {symbol}\n유형: {action}\n사유: {msg}")
                 return False
         except Exception as e:

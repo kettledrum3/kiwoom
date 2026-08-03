@@ -2291,6 +2291,50 @@
 
 ---
 
+## [usa20100] 미국주식 현재가 상세(시세)
+- **메뉴 위치**: 미국주식 > 시세 > 미국주식 현재가 상세(usa20100)
+- **HTTP Method**: `POST`
+- **Request URL**: `/api/us/mrkcond`
+- **Content-Type**: `application/json;charset=UTF-8`
+- **개요**: 미국주식의 현재가, 전일 종가 등의 종합 시세 정보를 단건 조회합니다.
+
+### Request Parameters
+| 구분 | Element | 한글명 | Type | 필수여부 | 길이 | 설명 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Header | `api-id` | TR명 | String | Y | 10 | 7자리 TR코드, `usa20100` |
+| Header | `authorization` | 접근토큰 | String | Y | 1000 | 토큰 지정시 토큰타입("Bearer") 붙여서 호출 |
+| Body | `stex_tp` | 거래소구분 | String | Y | | NA: AMEX, ND: NASDAQ, NY: NYSE |
+| Body | `stk_cd` | 종목코드 | String | Y | | 종목코드 (ex: NVDA, TQQQ) |
+
+### Response Fields
+| 구분 | Element | 한글명 | Type | 필수여부 | 길이 | 설명 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Header | `api-id` | TR명 | String | Y | 10 | 7자리 TR코드, `usa20100` |
+| Body | `base_close_pric` | 전일종가 | String/Float | N | | 전일종가 (단위: USD) |
+| Body | `cur_prc` | 현재가 | String/Float | N | | 현재가 (단위: USD) |
+| Body | `return_code` | 응답코드 | String/Int | Y | | 0: 정상 처리 |
+| Body | `return_msg` | 응답메시지 | String | Y | | 오류 메시지 혹은 정상 처리 메시지 |
+
+### Request Example
+```json
+{
+    "stex_tp": "ND",
+    "stk_cd": "NVDA"
+}
+```
+
+### Response Example
+```json
+{
+    "base_close_pric": "127.5000",
+    "cur_prc": "130.2500",
+    "return_code": 0,
+    "return_msg": "정상적으로 처리되었습니다"
+}
+```
+
+---
+
 ## [usa20280] 미국주식 조건검색 목록조회
 - **메뉴 위치**: 미국주식 > 조건검색 > 미국주식 조건검색 목록조회(usa20280)
 - **HTTP Method**: `POST`

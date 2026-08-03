@@ -28,7 +28,7 @@ class Broker:
         """호가 단위에 맞게 가격 보정 (기본값은 소수점 2자리 반올림)"""
         return round(price, 2)
         
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
         raise NotImplementedError
 
     def fetch_open_orders(self, symbol: str) -> List[dict]:

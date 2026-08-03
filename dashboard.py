@@ -1045,6 +1045,52 @@ else:
 
 @st.fragment(run_every=5)
 def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy_alias, currency_symbol, ActiveBroker):
+    if isinstance(symbol, str) and "(" in symbol:
+        symbol = symbol.split('(')[0].strip()
+        
+    # [Auto-Sync] 최초 로드 시 또는 30초 쿨다운 주기별로 백그라운드 잔고 자동 동기화 트리거
+    import time
+    now_ts = time.time()
+    last_auto_sync_key = f"last_auto_sync_{market_code}_{symbol}"
+    if 'live_account' not in st.session_state or st.session_state['live_account'].get('symbol') != symbol or (now_ts - st.session_state.get(last_auto_sync_key, 0) > 30.0):
+        try:
+            logger.info(f"🔄 [Auto-Sync] {symbol} {market_code} 실시간 잔고 자동 연동 및 동기화 실행")
+            shares, avg_price, eval_amt = ActiveBroker.get_account_equity(symbol)
+            pool = ActiveBroker.get_cash_pool()
+            current_price = ActiveBroker.get_price(symbol)
+            prev_close = ActiveBroker.get_previous_close(symbol)
+            
+            # DB 상태 업데이트 일관화
+            state_data = load_state_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
+            if state_data:
+                if strategy_choice == "CA":
+                    from core.cavr import CAState
+                    import math
+                    state_obj = CAState(**state_data)
+                    state_obj.avg_price = avg_price
+                    state_obj.total_shares = shares
+                    if state_obj.unit_buy_amount > 0:
+                        invested = avg_price * shares
+                        state_obj.current_turn = math.ceil((invested / state_obj.unit_buy_amount) * 10) / 10.0
+                    from core.database import save_state_db
+                    save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
+                    
+            st.session_state['live_account'] = {
+                'pool': state_data.get('pool', pool) if state_data else pool,
+                'broker_cash': pool,
+                'shares': shares,
+                'avg_price': avg_price,
+                'eval_amt': eval_amt,
+                'current_price': current_price,
+                'prev_close': prev_close,
+                'symbol': symbol,
+                'market_code': market_code,
+                'time': time.strftime("%H:%M:%S")
+            }
+            st.session_state[last_auto_sync_key] = now_ts
+        except Exception as auto_err:
+            logger.error(f"[Auto-Sync] 잔고 자동 조회 실패: {auto_err}")
+
     # 1. DB에서 가장 최신 상태 로드 (웹소켓 체결 업데이트가 실시간으로 반영됨)
     state = load_state_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
     is_new_strategy = False
@@ -1700,6 +1746,8 @@ if mode == "실전 투자":
     with col_act:
         if st.button("🔄 현재 계좌 상태 조회 (갱신)", width='stretch', type="primary"):
             with st.spinner(f"[{market_code}] 키움 API 조회 중..."):
+                if isinstance(symbol, str) and "(" in symbol:
+                    symbol = symbol.split('(')[0].strip()
                 broker = ActiveBroker
                 
                 # 정보 조회

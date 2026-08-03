@@ -291,7 +291,7 @@ class KiwoomKrBroker(Broker):
         else:
             return math.floor(price / tick) * tick
 
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
         """
         [국내주식] 주문 전송
         price_type (trde_tp): 지정가: "0", 시장가: "3" (키움증권 REST API 명세 기준)
@@ -328,12 +328,12 @@ class KiwoomKrBroker(Broker):
             if data.get('return_code') == 0:
                 odno = data.get('ord_no')
                 logger.info(f"🟢 [KR 주문 성공] {strategy} {action} {symbol} {qty}주 @ {price} (주문번호: {odno})")
-                log_order_db(symbol, strategy, action, price, qty, trde_tp, "ORDERED", odno, "성공", market="KR", strategy_name=strategy)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "ORDERED", odno, "성공", market="KR", strategy_name=strategy_name)
                 return True
             else:
                 msg = data.get('return_msg', '알 수 없는 오류')
                 logger.error(f"🔴 [KR 주문 실패] {strategy} {action} {symbol} {qty}주 @ {price} -> {msg}")
-                log_order_db(symbol, strategy, action, price, qty, trde_tp, "FAILED", "", msg, market="KR", strategy_name=strategy)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "FAILED", "", msg, market="KR", strategy_name=strategy_name)
                 send_telegram_message(f"🔴 <b>[KR 주문 실패]</b>\n종목: {symbol}\n유형: {action}\n사유: {msg}")
                 return False
         except Exception as e:

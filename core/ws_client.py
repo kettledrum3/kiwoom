@@ -336,6 +336,7 @@ class KisWebSocketClient:
                     is_open = True
                 if is_open:
                     ping_msg = {
+                        "trnm": "PING",
                         "header": {
                             "api-id": "PINGPONG",
                             "authorization": f"Bearer {self.approval_key}"

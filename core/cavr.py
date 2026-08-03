@@ -564,7 +564,7 @@ class Broker:
         """Returns the current total cost basis of the holding."""
         raise NotImplementedError
 
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
         raise NotImplementedError
 
     def fetch_open_orders(self, symbol: str) -> List[dict]:
@@ -953,7 +953,7 @@ class CostAveragingEngine:
         actual_cost = qty * price
         fee = actual_cost * self.config.fee_rate
         
-        if self.broker.place_order(self.config.symbol, price, qty, "BUY", price_type=price_type, strategy="CA"):
+        if self.broker.place_order(self.config.symbol, price, qty, "BUY", price_type=price_type, strategy="CA", strategy_name=self.config.strategy_name):
             # 성공 시 로그 기록
             current_t = turn if turn is not None else self.state.current_turn
             
@@ -1022,7 +1022,7 @@ class CostAveragingEngine:
         net_proceeds = proceeds - fee
         profit = net_proceeds - cost_basis
         
-        if self.broker.place_order(self.config.symbol, price, real_qty, "SELL", price_type=price_type, strategy="CA"):
+        if self.broker.place_order(self.config.symbol, price, real_qty, "SELL", price_type=price_type, strategy="CA", strategy_name=self.config.strategy_name):
             # [TPS 최적화]
             cum_amt = self.state.total_shares * self.state.avg_price
             est_cum_amt = max(0, cum_amt - cost_basis)
@@ -1854,7 +1854,7 @@ class ValueRebalancingEngine:
                             })
                     else:
                         if not self._is_already_ordered("SELL", limit_price, 1, open_orders_pool):
-                            self.broker.place_order(self.config.symbol, limit_price, 1, "SELL", price_type=ptype, strategy="VR")
+                            self.broker.place_order(self.config.symbol, limit_price, 1, "SELL", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                             time.sleep(0.2) # API rate limit
                         else: # type: ignore
                             logger.info(f"-> [VR 매도] {limit_price} 동일 주문 존재. 스킵.")
@@ -1881,7 +1881,7 @@ class ValueRebalancingEngine:
                             })
                 else:
                     if not self._is_already_ordered("BUY", limit_price, 1, open_orders_pool):
-                        self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR")
+                        self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                         time.sleep(0.2) # API rate limit
                     else: # type: ignore
                         logger.info(f"-> [VR 매수] {limit_price} 동일 주문 존재. 스킵.")
@@ -1925,7 +1925,7 @@ class ValueRebalancingEngine:
                 if cash_on_account >= buy_amount and current_price > 0:
                     qty = int(buy_amount / current_price)
                     if qty > 0:
-                        self.broker.place_order(self.config.symbol, current_price, qty, "BUY", price_type="00")
+                        self.broker.place_order(self.config.symbol, current_price, qty, "BUY", price_type="00", strategy="VR", strategy_name=self.config.strategy_name)
                         logger.info(f"  -> 초기 매수 {self.state.bootstrap_day_count + 1}/10: {qty}주 매수")
                 self.state.bootstrap_day_count += 1
             
@@ -1964,7 +1964,7 @@ class ValueRebalancingEngine:
                         # 체결가는 지정가와 당일 저가 중 큰 값 (지정가가 터무니없이 낮을 경우 Market Sell 효과 시뮬레이션)
                         exec_price = max(limit_sell_price, day_low)
                         logger.info(f"  -> 밴드 상단 지정가 매도 체결: 1주 @ ${exec_price:.2f} (Limit: ${limit_sell_price:.2f}, High: ${day_high:.2f})")
-                        self.broker.place_order(self.config.symbol, exec_price, 1, "SELL", price_type="00")
+                        self.broker.place_order(self.config.symbol, exec_price, 1, "SELL", price_type="00", strategy="VR", strategy_name=self.config.strategy_name)
                     else:
                         # 가격 오름차순(지정가가 높아짐)이므로, 낮은 가격이 체결 안 되면 더 높은 가격도 체결 안 됨
                         break
@@ -1993,7 +1993,7 @@ class ValueRebalancingEngine:
                     exec_price = min(limit_buy_price, day_high)
                     
                     # place_order 내에서 POOL 한도 및 현금 부족 체크 후 True/False 반환
-                    success = self.broker.place_order(self.config.symbol, exec_price, 1, "BUY", price_type="00")
+                    success = self.broker.place_order(self.config.symbol, exec_price, 1, "BUY", price_type="00", strategy="VR", strategy_name=self.config.strategy_name)
                     if success:
                         logger.info(f"  -> 밴드 하단 지정가 매수 체결: 1주 @ ${exec_price:.2f} (Limit: ${limit_buy_price:.2f}, Low: ${day_low:.2f})")
                     else:

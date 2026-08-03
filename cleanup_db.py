@@ -248,8 +248,97 @@ def normalize_symbols_in_db():
     conn.close()
     print(f"✅ [Normalize] {total_count}건의 종목 코드 정규화(A 제거)를 완료했습니다.")
 
+def cleanup_fake_finished_strategies():
+    """
+    finished_strategy_state 테이블에서 실제 매수 거래 내역(trade_history)이 없거나 
+    매수 원금이 0인 가짜 종료 전략 이력을 청소합니다. (REAL/MOCK 구분 없이 처리)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 1. 모든 종료된 전략 조회
+    cursor.execute("SELECT symbol, market, strategy_name, trade_mode FROM finished_strategy_state")
+    rows = cursor.fetchall()
+    
+    deleted_count = 0
+    for row in rows:
+        symbol, market, alias, trade_mode = row
+        
+        # 해당 전략 별칭에 해당하는 매수 거래가 있는지 확인
+        cursor.execute('''
+            SELECT COUNT(*) FROM trade_history 
+            WHERE symbol=? AND market=? AND strategy_name=? AND side='BUY'
+        ''', (symbol, market, alias))
+        buy_count = cursor.fetchone()[0]
+        
+        if buy_count == 0:
+            # 매수 거래가 전혀 없는 가짜 종료 전략이므로 삭제
+            cursor.execute('''
+                DELETE FROM finished_strategy_state 
+                WHERE symbol=? AND market=? AND strategy_name=? AND trade_mode=?
+            ''', (symbol, market, alias, trade_mode))
+            deleted_count += 1
+            print(f"🗑️ [Cleanup] 가짜 종료 전략 삭제: {symbol} ({alias}) | Mode: {trade_mode}")
+            
+    conn.commit()
+    conn.close()
+    print(f"✅ [Cleanup] 가짜 종료 전략 정리 완료 (총 {deleted_count}건 삭제)")
+
+def migrate_dirty_trades():
+    """
+    trade_history 테이블에 잘못 들어간 'TQQQ (QQQ 3X)' 및 'SOXL (Direct...)' 등의 종목명을 각각 'TQQQ', 'SOXL'로 교정하고,
+    별칭이 'CA'로 꼬인 부분을 올바른 별칭('TQQQ_1차', 'SOXL_1차')으로 수정합니다.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 1. TQQQ 교정
+    # symbol 교정
+    cursor.execute('''
+        UPDATE trade_history 
+        SET symbol = 'TQQQ' 
+        WHERE symbol LIKE 'TQQQ%' AND market = 'US'
+    ''')
+    tqqq_sym_count = cursor.rowcount
+    
+    # strategy_name 교정 ('CA' -> 'TQQQ_1차')
+    cursor.execute('''
+        UPDATE trade_history 
+        SET strategy_name = 'TQQQ_1차' 
+        WHERE symbol = 'TQQQ' AND strategy_name = 'CA' AND market = 'US'
+    ''')
+    tqqq_alias_count = cursor.rowcount
+    
+    # 2. SOXL 교정
+    # symbol 교정
+    cursor.execute('''
+        UPDATE trade_history 
+        SET symbol = 'SOXL' 
+        WHERE symbol LIKE 'SOXL%' AND market = 'US'
+    ''')
+    soxl_sym_count = cursor.rowcount
+    
+    # strategy_name 교정 ('CA' -> 'SOXL_1차')
+    cursor.execute('''
+        UPDATE trade_history 
+        SET strategy_name = 'SOXL_1차' 
+        WHERE symbol = 'SOXL' AND strategy_name = 'CA' AND market = 'US'
+    ''')
+    soxl_alias_count = cursor.rowcount
+    
+    conn.commit()
+    conn.close()
+    print(f"🛠️ [Migration] TQQQ: {tqqq_sym_count}건 심볼 교정 / {tqqq_alias_count}건 별칭 교정('TQQQ_1차')")
+    print(f"🛠️ [Migration] SOXL: {soxl_sym_count}건 심볼 교정 / {soxl_alias_count}건 별칭 교정('SOXL_1차')")
+
 if __name__ == "__main__":
     init_db() # DB가 초기화되었는지 확인
+
+    print("\n🧹 [Cleanup] 가짜 종료 전략 정리 작업을 시작합니다...")
+    cleanup_fake_finished_strategies()
+
+    print("\n🧹 [Migration] 미국 시장(TQQQ/SOXL) 오염 데이터 교정 작업을 시작합니다...")
+    migrate_dirty_trades()
 
     print("\n🧹 [Cleanup] 날짜 필드에서 '(수신)' 태그 제거 작업을 시작합니다...")
     remove_received_tag_from_dates()

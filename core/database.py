@@ -890,14 +890,21 @@ def sync_open_orders_db(symbol, open_orders):
         
     except Exception as e:
         logger.error(f"Failed to sync orders for {symbol}: {e}")
-
 def sync_trade_history_db(symbol, executions, strategy=None, market="US", strategy_name=None, silent=False):
     """API 체결 내역과 DB 거래 내역 동기화 (누락분 추가)"""
     try:
         # [NML] 심볼 정규화 (한국 주식 코드 A122630 -> 122630 대응)
         symbol = str(symbol).strip().upper()
+        if "(" in symbol:
+            symbol = symbol.split('(')[0].strip()
         if symbol.startswith('A') and len(symbol) == 7 and symbol[1:].isdigit():
             symbol = symbol[1:]
+
+        if strategy_name:
+            strategy_name = str(strategy_name).strip()
+            if strategy_name in ["CA", "VR", "SYNC", "MANUAL"]:
+                strategy_name = ""
+
         conn = get_connection()
         cursor = conn.cursor()
         
