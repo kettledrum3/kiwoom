@@ -58,6 +58,11 @@ class KiwoomKrBroker(Broker):
         self.trade_mode = trade_mode
         self.etf_tickers = self._load_etf_list()
 
+        # 캐시 딕셔너리 초기화
+        self._stkinfo_cache = {}
+        self._prev_close_cache = {}
+        self._acnt_cache = {}
+
     def _call_api(self, method, url, tr_id, params=None, data=None, extra_headers=None):
         res = None
         max_retries = 3
@@ -84,6 +89,12 @@ class KiwoomKrBroker(Broker):
                     logger.error(f"❌ [KR API] Final failure after {max_retries} attempts: {e}")
                     return None
             
+            # 429 Too Many Requests 대응
+            if res.status_code == 429:
+                logger.warning(f"⚠️ [KR API] 429 Too Many Requests 감지. 1.5초 대기 후 재시도 ({attempt+1}/{max_retries})")
+                time.sleep(1.5)
+                continue
+
             # 토큰 만료 대응 (401 Unauthorized)
             if res.status_code == 401:
                 logger.warning(f"⚠️ [KR API] 토큰 만료(401). 1초 대기 후 재발급 및 재시도.")
@@ -111,7 +122,15 @@ class KiwoomKrBroker(Broker):
                     time.sleep(1.0)
                     continue
 
-                # TPS 제한 감지 및 대응
+                # TPS 및 요청건수 제한 감지 및 대응
+                if rt_cd == 5 or (rt_msg and "요청 건수를 초과" in rt_msg):
+                    if "일 API 요청 건수" in rt_msg or "일일" in rt_msg:
+                        logger.error(f"🔴 [KR API] 일일 API 요청 한도 초과 감지: {rt_msg}")
+                        return res
+                    logger.warning(f"⚠️ [KR API] TPS 초과 제한 감지 ({rt_msg}). 1.5초 후 재시도 ({attempt+1}/{max_retries})")
+                    time.sleep(1.5)
+                    continue
+
                 if rt_msg and "초당 거래건수를 초과" in rt_msg:
                     logger.warning(f"⚠️ [KR API] TPS 제한 감지. 2초 후 재시도 ({attempt+1}/{max_retries})")
                     time.sleep(2.0)
@@ -135,54 +154,89 @@ class KiwoomKrBroker(Broker):
             logger.warning(f"[KiwoomKrBroker] ETF 리스트 로드 실패 (기본 호가 단위 적용): {e}")
         return tickers
 
-    def get_price(self, symbol: str) -> float:
+    def _get_stkinfo(self, symbol: str) -> Optional[dict]:
+        """주식기본정보(ka10001) 캐싱 헬퍼 (5초 유효)"""
+        now_ts = time.time()
+        if hasattr(self, '_stkinfo_cache') and symbol in self._stkinfo_cache:
+            cache_ts, cache_data = self._stkinfo_cache[symbol]
+            if now_ts - cache_ts < 5.0:
+                logger.debug(f"💾 [KR Price Cache Hit] {symbol} 시세 캐시 재사용")
+                return cache_data
+
         url = f"{self.base_url}/api/dostk/stkinfo"
         body = {"stk_cd": symbol}
         res = self._call_api("POST", url, "ka10001", data=json.dumps(body))
         if res:
             data = res.json()
             if data.get('return_code') == 0:
-                val = data.get('cur_prc')
-                if val is not None:
-                    return float(val)
-        logger.error(f"[KR] 현재가 조회 실패 ({symbol}): {res.text if res else 'No Response'}")
+                self._stkinfo_cache[symbol] = (now_ts, data)
+                return data
+        return None
+
+    def get_price(self, symbol: str, force: bool = False) -> float:
+        data = self._get_stkinfo(symbol)
+        if data:
+            val = data.get('cur_prc')
+            if val is not None:
+                clean_val = str(val).replace('+', '').replace('-', '')
+                return float(clean_val)
+        logger.error(f"[KR] 현재가 조회 실패 ({symbol})")
         return 0.0
 
     def get_previous_close(self, symbol: str) -> float:
-        url = f"{self.base_url}/api/dostk/stkinfo"
-        body = {"stk_cd": symbol}
-        res = self._call_api("POST", url, "ka10001", data=json.dumps(body))
+        # 오늘 날짜 기준으로 전일종가 캐시 확인
+        today_str = datetime.now().strftime("%Y%m%d")
+        if hasattr(self, '_prev_close_cache') and symbol in self._prev_close_cache:
+            cache_date, val = self._prev_close_cache[symbol]
+            if cache_date == today_str:
+                return val
+
+        # ka10086 (일별주가요청)을 사용하여 정확한 전일종가 획득
+        url = f"{self.base_url}/api/dostk/mrkcond"
+        body = {
+            "stk_cd": symbol,
+            "qry_dt": today_str,
+            "indc_tp": "0"
+        }
+        res = self._call_api("POST", url, "ka10086", data=json.dumps(body))
         if res:
             data = res.json()
             if data.get('return_code') == 0:
-                val = data.get('base_pric')
-                if val is not None:
-                    return float(val)
+                daly_stkpc = data.get('daly_stkpc', [])
+                if daly_stkpc:
+                    # 첫 번째 영업일이 오늘과 같으면, 두 번째 영업일이 전일 종가임
+                    if daly_stkpc[0].get('date') == today_str:
+                        if len(daly_stkpc) > 1:
+                            val = daly_stkpc[1].get('close_pric')
+                        else:
+                            val = daly_stkpc[0].get('close_pric')
+                    else:
+                        val = daly_stkpc[0].get('close_pric')
+
+                    if val is not None:
+                        clean_val = str(val).replace('+', '').replace('-', '')
+                        float_val = float(clean_val)
+                        self._prev_close_cache[symbol] = (today_str, float_val)
+                        return float_val
         logger.error(f"[KR] 전일종가 조회 실패 ({symbol}): {res.text if res else 'No Response'}")
         return 0.0
 
     def get_current_high(self, symbol: str) -> float:
-        url = f"{self.base_url}/api/dostk/stkinfo"
-        body = {"stk_cd": symbol}
-        res = self._call_api("POST", url, "ka10001", data=json.dumps(body))
-        if res:
-            data = res.json()
-            if data.get('return_code') == 0:
-                val = data.get('high_pric')
-                if val is not None:
-                    return float(val)
+        data = self._get_stkinfo(symbol)
+        if data:
+            val = data.get('high_pric')
+            if val is not None:
+                clean_val = str(val).replace('+', '').replace('-', '')
+                return float(clean_val)
         return 0.0
 
     def get_current_low(self, symbol: str) -> float:
-        url = f"{self.base_url}/api/dostk/stkinfo"
-        body = {"stk_cd": symbol}
-        res = self._call_api("POST", url, "ka10001", data=json.dumps(body))
-        if res:
-            data = res.json()
-            if data.get('return_code') == 0:
-                val = data.get('low_pric')
-                if val is not None:
-                    return float(val)
+        data = self._get_stkinfo(symbol)
+        if data:
+            val = data.get('low_pric')
+            if val is not None:
+                clean_val = str(val).replace('+', '').replace('-', '')
+                return float(clean_val)
         return 0.0
 
     def get_last_5_day_avg_close(self, symbol: str) -> float:
@@ -213,19 +267,35 @@ class KiwoomKrBroker(Broker):
             logger.error(f"[KR] 5일 평균가 파싱 오류: {e}")
         return 0.0
 
-    def get_account_equity(self, symbol: str) -> Tuple[float, float, float]:
+    def _get_acnt_info(self) -> Optional[dict]:
+        """계좌 잔고 및 예수금 정보(kt00004) 캐싱 헬퍼 (5초 유효)"""
+        now_ts = time.time()
+        cache_key = "acnt_info"
+        if hasattr(self, '_acnt_cache') and cache_key in self._acnt_cache:
+            cache_ts, cache_data = self._acnt_cache[cache_key]
+            if now_ts - cache_ts < 5.0:
+                logger.debug("💾 [KR Account Cache Hit] 계좌 정보 캐시 재사용")
+                return cache_data
+
         url = f"{self.base_url}/api/dostk/acnt"
         body = {
             "qry_tp": "0",
             "dmst_stex_tp": "KRX"
         }
-        try:
-            res = self._call_api("POST", url, "kt00004", data=json.dumps(body))
-            if not res:
-                return 0.0, 0.0, 0.0
+        res = self._call_api("POST", url, "kt00004", data=json.dumps(body))
+        if res:
             data = res.json()
-            if data.get('return_code') != 0:
-                logger.error(f"[KR] 잔고 조회 실패: {data.get('return_msg')}")
+            if data.get('return_code') == 0:
+                if not hasattr(self, '_acnt_cache'):
+                    self._acnt_cache = {}
+                self._acnt_cache[cache_key] = (now_ts, data)
+                return data
+        return None
+
+    def get_account_equity(self, symbol: str) -> Tuple[float, float, float]:
+        try:
+            data = self._get_acnt_info()
+            if not data:
                 return 0.0, 0.0, 0.0
                 
             for item in data.get('stk_acnt_evlt_prst', []):
@@ -245,19 +315,11 @@ class KiwoomKrBroker(Broker):
         return shares * avg_price
 
     def get_cash_pool(self) -> float:
-        url = f"{self.base_url}/api/dostk/acnt"
-        body = {
-            "qry_tp": "0",
-            "dmst_stex_tp": "KRX"
-        }
-        res = self._call_api("POST", url, "kt00004", data=json.dumps(body))
-        if res:
-            data = res.json()
-            if data.get('return_code') == 0:
-                # D+2추정예수금 반환
-                val = data.get('d2_entra')
-                if val is not None:
-                    return float(val)
+        data = self._get_acnt_info()
+        if data:
+            val = data.get('d2_entra')
+            if val is not None:
+                return float(val)
         logger.error("[KR] 예수금 조회 실패")
         return 0.0
 

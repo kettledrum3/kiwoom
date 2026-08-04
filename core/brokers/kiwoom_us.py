@@ -55,6 +55,7 @@ class KiwoomUsBroker(Broker):
 
         self.cano = self.account_no
         self.trade_mode = trade_mode
+        self._exchange_rate_cache = None
         
         # 키움용 거래소 맵 (NASDAQ: ND, NYSE: NY, AMEX: NA)
         self.exchange_map = {"TQQQ": "ND", "SOXL": "NY", "SQQQ": "ND"}
@@ -116,13 +117,13 @@ class KiwoomUsBroker(Broker):
                 time.sleep(1.0)
         return res
 
-    def _get_chart_data(self, symbol: str) -> Optional[List[dict]]:
+    def _get_chart_data(self, symbol: str, force: bool = False) -> Optional[List[dict]]:
         """usa06012 (미국주식 일 차트) API를 호출하여 일봉 데이터 리스트를 가져옵니다."""
-        # 1. 캐시 확인 (30초 이내 재호출 시 API 부하 방지용)
+        # 1. 캐시 확인 (60초 이내 재호출 시 API 부하 방지용)
         now_ts = time.time()
-        if symbol in self._chart_cache:
+        if not force and symbol in self._chart_cache:
             cache_ts, cache_data = self._chart_cache[symbol]
-            if now_ts - cache_ts < 30.0:
+            if now_ts - cache_ts < 60.0:
                 logger.debug(f"💾 [US Chart Cache Hit] {symbol} 일봉 차트 캐시 재사용")
                 return cache_data
 
@@ -141,7 +142,7 @@ class KiwoomUsBroker(Broker):
             data = res.json()
             if data.get('return_code') == 0 and data.get('result_list'):
                 latest = data['result_list'][0]
-                logger.info(f"🔍 [US API Debug] usa06012 조회 성공 ({symbol}) - 최근영업일({latest.get('dt')}): 현재가 {latest.get('cur_prc')}$")
+                # logger.info(f"🔍 [US API Debug] usa06012 조회 성공 ({symbol}) - 최근영업일({latest.get('dt')}): 현재가 {latest.get('cur_prc')}$")
             else:
                 logger.warning(f"🔍 [US API Debug] usa06012 응답 실패 ({symbol}): {data.get('return_msg')}")
             if data.get('return_code') == 0:
@@ -151,8 +152,8 @@ class KiwoomUsBroker(Broker):
                 return result
         return None
 
-    def get_price(self, symbol: str) -> float:
-        chart = self._get_chart_data(symbol)
+    def get_price(self, symbol: str, force: bool = False) -> float:
+        chart = self._get_chart_data(symbol, force=force)
         if chart:
             val = chart[0].get('cur_prc')
             if val is not None:
@@ -235,7 +236,7 @@ class KiwoomUsBroker(Broker):
         logger.warning(f"[US] 5일 평균가 조회 실패 ({symbol})")
         return 0.0
 
-    def get_exchange_rate(self) -> dict:
+    def get_exchange_rate(self, force: bool = False) -> dict:
         """환율 조회 (Exchangerate.host API 우선 적용 및 키움 ust31301 API Fallback 이중화)"""
         import pytz
         from core.database import get_config, set_config
@@ -243,6 +244,12 @@ class KiwoomUsBroker(Broker):
         # 1. 미국 동부 시각(America/New_York) 기준 오늘 날짜 획득
         ny_tz = pytz.timezone('America/New_York')
         today_str = datetime.now(ny_tz).strftime("%Y-%m-%d")
+        
+        # 0. 메모리 캐시 확인 (강제 조회가 아니고, 오늘 날짜 캐시가 존재하면 갱신 안 함)
+        if not force and hasattr(self, '_exchange_rate_cache') and self._exchange_rate_cache:
+            cache_date, cache_data = self._exchange_rate_cache
+            if cache_date == today_str:
+                return cache_data
         
         ex_key = os.getenv("EXCHANGERATE_KEY", "").strip()
         use_external_api = False
@@ -271,11 +278,13 @@ class KiwoomUsBroker(Broker):
                         db_rate = float(db_rate_str)
                         if db_rate > 0:
                             logger.info(f"💵 [ExchangeRate] 3회 초과 호출로 인해 DB에 이미 저장된 오늘 자 환율을 반환합니다: {db_rate:.2f}원")
-                            return {
+                            res_dict = {
                                 "rate": db_rate,
                                 "diff": 0.0,
                                 "pct": 0.0
                             }
+                            self._exchange_rate_cache = (today_str, res_dict)
+                            return res_dict
                     except ValueError:
                         pass
                 logger.warning(f"⚠️ [ExchangeRate] DB에 저장된 오늘 자 환율 정보가 없어 키움 API로 조회를 대체합니다.")
@@ -298,11 +307,13 @@ class KiwoomUsBroker(Broker):
                             set_config("EXCHANGERATE_CALL_DATE", today_str)
                             set_config("EXCHANGERATE_CALL_COUNT", str(call_count + 1))
                             logger.info(f"💵 [ExchangeRate] Exchangerate.host 최신 환율 조회 성공: 1달러당 {rate:.2f}원 (누적 {call_count + 1}회)")
-                            return {
+                            res_dict = {
                                 "rate": rate,
                                 "diff": 0.0,
                                 "pct": 0.0
                             }
+                            self._exchange_rate_cache = (today_str, res_dict)
+                            return res_dict
                 logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host 응답이 올바르지 않습니다. (Status: {response.status_code})")
             except Exception as e:
                 logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API 호출 중 오류 발생: {e}. 키움 API로 대체하여 조회합니다.")
@@ -319,12 +330,16 @@ class KiwoomUsBroker(Broker):
             if data.get('return_code') == 0:
                 rate = float(data.get('aplc_exrt', 0))
                 logger.info(f"💵 [ExchangeRate] 키움증권 API 환율 조회 성공: 1달러당 {rate:.2f}원")
-                return {
+                res_dict = {
                     "rate": rate,
                     "diff": 0.0,
                     "pct": 0.0
                 }
-        return {"rate": 0.0, "diff": 0.0, "pct": 0.0}
+                self._exchange_rate_cache = (today_str, res_dict)
+                return res_dict
+        res_dict = {"rate": 0.0, "diff": 0.0, "pct": 0.0}
+        self._exchange_rate_cache = (today_str, res_dict)
+        return res_dict
 
     def get_exchange_rate_history(self, start_date: str, end_date: str) -> List[dict]:
         # 환율 이력을 구하는 TR이 단일 시트에 없으므로 현재 환율을 활용하거나 기존 방식을 대체
@@ -346,10 +361,11 @@ class KiwoomUsBroker(Broker):
             data = res.json()
             if data.get('return_code') == 0:
                 res_list = data.get('result_list', [])
-                logger.info(f"🔍 [US API Debug] ust21070 조회 성공 - 보유 종목 수: {len(res_list)}개")
+                # logger.info(f"🔍 [US API Debug] ust21070 조회 성공 - 보유 종목 수: {len(res_list)}개")
                 for item in res_list:
                     if item.get('stk_cd', '').strip().upper() == symbol.strip().upper():
-                        logger.info(f"   -> {symbol} 발견: 수량 {item.get('poss_qty')}주, 평단가 {item.get('frgn_stk_book_uv')}$, 평가금액 {item.get('evlt_amt')}$")
+                        poss_qty_val = int(float(item.get('poss_qty', 0)))
+                        # logger.info(f"   -> {symbol} 발견: 수량 {poss_qty_val}주, 평단가 {item.get('frgn_stk_book_uv')}$, 평가금액 {item.get('evlt_amt')}$")
                         return float(item.get('poss_qty', 0)), float(item.get('frgn_stk_book_uv', 0)), float(item.get('evlt_amt', 0))
             else:
                 logger.warning(f"🔍 [US API Debug] ust21070 응답 실패: {data.get('return_msg')}")

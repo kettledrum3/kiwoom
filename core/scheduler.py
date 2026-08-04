@@ -96,6 +96,24 @@ def is_biweekly_friday(d: datetime) -> bool:
     week_number = d.isocalendar()[1]
     return week_number % 2 == 0
 
+def check_vr_cycle_day(d: datetime, freq: str) -> bool:
+    """지정된 주기에 따라 오늘이 적립/인출 실행일인지 판단"""
+    if freq == "매일":
+        return d.weekday() < 5
+    elif freq == "매주 금요일":
+        return d.weekday() == 4
+    elif freq == "격주 금요일 (2주)":
+        if d.weekday() != 4:
+            return False
+        week_number = d.isocalendar()[1]
+        return week_number % 2 == 0
+    elif freq == "4주마다 금요일":
+        if d.weekday() != 4:
+            return False
+        week_number = d.isocalendar()[1]
+        return week_number % 4 == 0
+    return False
+
 def update_heartbeat():
     """스케줄러가 살아있음을 DB에 기록 (매 1분)"""
     try:
@@ -204,11 +222,12 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
         return
 
     today = datetime.now()
-    is_cycle_day = is_biweekly_friday(today)
 
     for i, state_data in enumerate(vr_states):
         symbol = state_data.get('symbol')
         alias = state_data.get('strategy_name', '')
+        freq = state_data.get('freq', '격주 금요일 (2주)')
+        is_cycle_day = check_vr_cycle_day(today, freq)
 
         if i > 0:
             logger.info(f"⏳ 다음 전략 실행 전 60초간 대기합니다... ({i+1}/{len(vr_states)})")
@@ -218,7 +237,7 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
             logger.info(f"⏭️ [VR-{market}] '{symbol}' ({alias}) 전략이 일시 정지 상태입니다. 건너뜁니다.")
             continue
 
-        logger.info(f"==> [{market}] '{symbol}' ({alias}) VR 전략 처리 시작...")
+        logger.info(f"==> [{market}] '{symbol}' ({alias}) VR 전략 처리 시작 (주기: {freq}, 오늘 실행 여부: {is_cycle_day})...")
 
         if broker.get_cash_pool() < 50: # 최소 안전 마진
              send_telegram_message(f"⚠️ <b>[잔고 부족]</b> {symbol} VR 매수를 위한 예수금이 부족합니다. 매도 주문만 시도합니다.")
@@ -307,7 +326,7 @@ def job_update_exchange_rate(broker=None, force=False, is_post_market=False):
             from core.brokers.kiwoom_us import KiwoomUsBroker
             broker = KiwoomUsBroker()
             
-        rate_info = broker.get_exchange_rate()
+        rate_info = broker.get_exchange_rate(force=force)
         rate = rate_info.get("rate", 0.0)
 
         if rate > 0:

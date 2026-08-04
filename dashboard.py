@@ -805,19 +805,27 @@ with st.sidebar:
             def_b = (d_state.get('band_high_pct', 115.0) if d_state else 115.0) - 100.0
             
             g_val = st.slider("G 값", 10, 30, int(def_g), key=f"{m_lower}_{widget_suffix}_vr_g")
-            b_pct = st.slider("밴드 (%)", 10, 30, int(def_b), key=f"{m_lower}_{widget_suffix}_vr_b")
+            b_pct = st.slider("밴드 (%)", 5, 30, int(def_b), key=f"{m_lower}_{widget_suffix}_vr_b")
             
             v_type_disp = st.selectbox("투자 방식", ["적립식", "거치식", "인출식"], key=f"{m_lower}_{widget_suffix}_vr_type")
             type_map = {"적립식": "accumulation", "거치식": "deferment", "인출식": "withdrawal"}
             v_type = type_map[v_type_disp]
             
             p_amt = st.number_input(f"주기별 적립/인출액 ({m_curr})", value=float(def_pa), key=f"{m_lower}_{widget_suffix}_vr_pa")
-            v_freq = st.selectbox("주기", ["매주 금요일", "격주 금요일 (2주)", "4주마다 금요일"], index=1, key=f"{m_lower}_{widget_suffix}_vr_freq")
+            v_freq = st.selectbox("주기", ["매일", "매주 금요일", "격주 금요일 (2주)", "4주마다 금요일"], index=2, key=f"{m_lower}_{widget_suffix}_vr_freq")
+            
+            # [신규] 0일차 기존 잔고 편입 체크박스 옵션 제공 (DB 상태가 없거나 수량이 0인 신규 세팅 시 사용)
+            include_existing = st.checkbox("기존 잔고 편입 (0일차)", value=False, key=f"{m_lower}_{widget_suffix}_vr_inc_exist", help="체크 시 계좌에 이미 보유 중인 주식 수량과 평단가를 이 전략의 0일차 시작 잔고로 편입합니다.")
+            
+            # [신규] 초기 빌드업 일수 (영업일 수 기준)
+            bootstrap_days = st.slider("초기 빌드업 일수 (일)", 5, 20, 10, key=f"{m_lower}_{widget_suffix}_vr_boot_days", help="전략 기동 시 실제 VR 지정가 분할 매매 예약을 시작하기 전, 안전하게 분할 매수를 집행하여 초기 주식 비중을 확보할 영업일 수입니다.")
             
             return {
                 "mode": internal_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": def_pool,
                 "g_value": g_val, "band_pct": b_pct, "periodic_amt": p_amt,
                 "initial_cash": i_cash, "investment_type": v_type, "freq": v_freq, "invest_type_disp": v_type_disp,
+                "include_existing": include_existing,
+                "bootstrap_days": bootstrap_days,
                 "fetch_days": f_days, "fee_rate": f_rate, "tax_rate": t_rate
             }
 
@@ -871,6 +879,8 @@ with st.sidebar:
         vr_investment_type = active_settings["investment_type"]
         vr_freq = active_settings["freq"]
         vr_invest_type_disp = active_settings["invest_type_disp"]
+        vr_include_existing = active_settings.get("include_existing", False)
+        vr_bootstrap_days = active_settings.get("bootstrap_days", 10)
 
     st.divider()
 
@@ -938,15 +948,55 @@ with st.sidebar:
                     # 나머지 필드는 기본값 사용
                 )
             elif strategy_choice == "VR":
+                # 기존 잔고를 편입하거나 미편입하는 로직 적용
+                broker = ActiveBroker
+                shares, avg_price, eval_amt = broker.get_account_equity(symbol)
+                
+                if vr_include_existing:
+                    initial_shares = shares
+                    initial_avg_price = avg_price
+                    stock_value = eval_amt
+                else:
+                    initial_shares = 0.0
+                    initial_avg_price = 0.0
+                    stock_value = 0.0
+                
+                # 운용자본금을 모두 pool에 부여
+                initial_pool = initial_cash
+                
+                # V 계산: pool(초기자본금) + 편입한 주식 가치
+                initial_V = initial_pool + stock_value
+                
+                pool_limit_ratio = 0.5
+                if "accumulation" in vr_investment_type: pool_limit_ratio = 0.75
+                elif "withdrawal" in vr_investment_type: pool_limit_ratio = 0.25
+                
+                bootstrap_order_amt = (initial_pool * pool_limit_ratio) / vr_bootstrap_days
+                new_mode = "RUNNING" if vr_include_existing else "BOOTSTRAP"
+                
                 new_state = VRState(
                     symbol=symbol,
                     strategy_type="VR",
                     strategy_name=strategy_alias,
                     market=market_code,
-                    initial_budget=initial_cash, # 사이드바 초기자본 값 사용
-                    pool=allocated_pool,       # 할당 예수금 저장
+                    initial_budget=initial_cash,
+                    pool=initial_pool,
                     periodic_accumulation=vr_periodic_amt,
-                    # 나머지 필드는 기본값 사용
+                    freq=vr_freq,
+                    V=initial_V,
+                    last_E=stock_value, # E는 주식 평가액 단독
+                    cycle_V=initial_V,
+                    cycle_start_pool=initial_pool,
+                    total_shares=initial_shares,
+                    avg_price=initial_avg_price,
+                    mode=new_mode,
+                    bootstrap_days=vr_bootstrap_days,
+                    bootstrap_day_count=0,
+                    bootstrap_order_amount=bootstrap_order_amt,
+                    G=vr_g_value,
+                    band_low_pct=100.0 - vr_band_pct,
+                    band_high_pct=100.0 + vr_band_pct,
+                    investment_type=vr_investment_type
                 )
             
             # DB에 저장
@@ -960,12 +1010,16 @@ with st.sidebar:
             st.sidebar.warning("백테스트 모드에서는 전략을 저장할 수 없습니다.")
     if update_strategy_btn:
         if mode == "실전 투자":
-            # 기존 전략 로드
-            existing_state_data = load_state_db(symbol, strategy_choice, market=market_code)
+            # 기존 전략 로드 (별칭 조건 추가)
+            existing_state_data = load_state_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
             if existing_state_data:
+                import dataclasses
                 # 현재 사이드바 파라미터로 업데이트
                 if strategy_choice == "CA":
-                    state_obj = CAState(**existing_state_data)
+                    # 데이터클래스 생성자에 없는 여분 필드 필터링 (TypeError 방지)
+                    valid_keys = {f.name for f in dataclasses.fields(CAState)}
+                    filtered_data = {k: v for k, v in existing_state_data.items() if k in valid_keys}
+                    state_obj = CAState(**filtered_data)
                     state_obj.strategy_name = strategy_alias
                     state_obj.version = ca_version
                     state_obj.cycle_budget = initial_cash
@@ -975,7 +1029,10 @@ with st.sidebar:
                     state_obj.target_profit_pct = target_profit
                     state_obj.use_quarter_stop = use_quarter_stop
                 elif strategy_choice == "VR":
-                    state_obj = VRState(**existing_state_data)
+                    # 데이터클래스 생성자에 없는 여분 필드 필터링 (TypeError 방지)
+                    valid_keys = {f.name for f in dataclasses.fields(VRState)}
+                    filtered_data = {k: v for k, v in existing_state_data.items() if k in valid_keys}
+                    state_obj = VRState(**filtered_data)
                     state_obj.strategy_name = strategy_alias
                     state_obj.initial_budget = initial_cash
                     state_obj.pool = allocated_pool
@@ -983,6 +1040,7 @@ with st.sidebar:
                     state_obj.G = vr_g_value
                     state_obj.band_low_pct = 100.0 - vr_band_pct
                     state_obj.band_high_pct = 100.0 + vr_band_pct
+                    state_obj.freq = vr_freq
                     state_obj.investment_type = vr_investment_type
                                     
                 save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
@@ -1052,7 +1110,27 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
     import time
     now_ts = time.time()
     last_auto_sync_key = f"last_auto_sync_{market_code}_{symbol}"
-    if 'live_account' not in st.session_state or st.session_state['live_account'].get('symbol') != symbol or (now_ts - st.session_state.get(last_auto_sync_key, 0) > 30.0):
+    
+    # 한국/미국 시장의 장중 여부 판별
+    is_market_active = True
+    if market_code == "KR":
+        kr_tz = pytz.timezone('Asia/Seoul')
+        now_kr = datetime.now(kr_tz)
+        if now_kr.weekday() >= 5:
+            is_market_active = False
+        else:
+            is_market_active = dtime(8, 30) <= now_kr.time() <= dtime(16, 0)
+    elif market_code == "US":
+        us_tz = pytz.timezone('America/New_York')
+        now_us = datetime.now(us_tz)
+        if now_us.weekday() >= 5:
+            is_market_active = False
+        else:
+            is_market_active = dtime(7, 0) <= now_us.time() <= dtime(18, 0)
+            
+    sync_interval = 300.0 if is_market_active else 3600.0
+    
+    if 'live_account' not in st.session_state or st.session_state['live_account'].get('symbol') != symbol or (now_ts - st.session_state.get(last_auto_sync_key, 0) > sync_interval):
         try:
             logger.info(f"🔄 [Auto-Sync] {symbol} {market_code} 실시간 잔고 자동 연동 및 동기화 실행")
             shares, avg_price, eval_amt = ActiveBroker.get_account_equity(symbol)
@@ -1074,6 +1152,18 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
                         state_obj.current_turn = math.ceil((invested / state_obj.unit_buy_amount) * 10) / 10.0
                     from core.database import save_state_db
                     save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
+                elif strategy_choice == "VR":
+                    from core.cavr import VRState
+                    import dataclasses
+                    db_avg_price = state_data.get('avg_price', 0.0)
+                    if db_avg_price > 0.0:
+                        valid_keys = {f.name for f in dataclasses.fields(VRState)}
+                        filtered_data = {k: v for k, v in state_data.items() if k in valid_keys}
+                        state_obj = VRState(**filtered_data)
+                        state_obj.total_shares = shares
+                        state_obj.avg_price = avg_price
+                        from core.database import save_state_db
+                        save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
                     
             st.session_state['live_account'] = {
                 'pool': state_data.get('pool', pool) if state_data else pool,
@@ -1136,8 +1226,12 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
 
     # 수치 추출 (DB 기반 - 웹소켓 클라이언트가 업데이트한 값)
     pool = state.get('pool', 0.0)
-    shares = state.get('total_shares', 0.0)
-    avg_price = state.get('avg_price', 0.0)
+    if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
+        shares = st.session_state['live_account'].get('shares', state.get('total_shares', 0.0))
+        avg_price = st.session_state['live_account'].get('avg_price', state.get('avg_price', 0.0))
+    else:
+        shares = state.get('total_shares', 0.0)
+        avg_price = state.get('avg_price', 0.0)
     
     # s_pool 계산: CA는 pool - (shares * avg_price), VR은 pool 그대로
     if strategy_choice == "CA":
@@ -1159,7 +1253,16 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
     if is_new_strategy:
         st.info("💡 등록된 전략 상태가 없습니다. 기본 정보(시세, 예수금)를 기반으로 임시 상태가 표시되고 있습니다. 신규전략 저장 및 실행 시 DB에 저장됩니다.")
     col_p1, col_p2 = st.columns(2)
-    col_p1.metric(label=f"💰 전략 할당 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(s_pool, market_code)}", help="설정된 전체 예수금에서 현재 투입액을 차감한 실시간 가용 예수금(s_pool)입니다.")
+    if strategy_choice == "VR":
+        display_val = state.get('initial_budget', 0.0)
+        label_name = f"💰 운용 자본금 ({currency_symbol})"
+        help_text = "설정된 전체 운용 자본금(initial_budget)입니다."
+    else:
+        display_val = s_pool
+        label_name = f"💰 전략 할당 예수금 ({currency_symbol})"
+        help_text = "설정된 전체 예수금에서 현재 투입액을 차감한 실시간 가용 예수금(s_pool)입니다."
+
+    col_p1.metric(label=label_name, value=f"{currency_symbol}{format_currency(display_val, market_code)}", help=help_text)
     col_p2.metric(label=f"🏦 거래소 총 예수금 ({currency_symbol})", value=f"{currency_symbol}{format_currency(broker_cash, market_code)}", help="증권사 계좌의 실제 주문 가능 원금입니다. 계좌 상태 조회 시 갱신됩니다.")
 
     st.subheader(f"보유 종목 현황: {format_ticker_display(symbol, market_code)}")
@@ -1197,8 +1300,16 @@ def render_market_tab(m_code):
                     st.write(f"T: **{s.get('current_turn', 0):.1f}** / 평단: {cur_sym}{format_currency(s.get('avg_price', 0), m_code)} / 보유: {s.get('total_shares', 0)}주")
                     st.write(f"할당 예수금: {cur_sym}{format_currency(s.get('pool', 0), m_code)} / 분할수: {s.get('a_default', 40)} / 1회매수금: {cur_sym}{format_currency(s.get('unit_buy_amount', 0), m_code)} / 목표수익률: {s.get('target_profit_pct', 0.1)*100:.1f}%")
                 else:
-                    st.write(f"목표V: {cur_sym}{format_currency(s.get('cycle_V', 0), m_code)} / Pool: {cur_sym}{format_currency(s.get('pool', 0), m_code)}")
-                    st.write(f"운용 자본금: {cur_sym}{format_currency(s.get('initial_budget', 0), m_code)} / G값: {s.get('G', 10)} / 적립액: {cur_sym}{format_currency(s.get('periodic_accumulation', 0), m_code)}")
+                    initial_budget_val = s.get('initial_budget', 0.0)
+                    cycle_V_val = s.get('cycle_V', 0.0)
+                    pool_val = s.get('pool', 0.0)
+                    if cycle_V_val == 0.0 and initial_budget_val > 0:
+                        cycle_V_val = initial_budget_val
+                    if pool_val == 0.0 and initial_budget_val > 0:
+                        pool_val = initial_budget_val
+                    band_pct = s.get('band_high_pct', 115.0) - 100.0
+                    st.write(f"목표V: {cur_sym}{format_currency(cycle_V_val, m_code)} / Pool: {cur_sym}{format_currency(pool_val, m_code)}")
+                    st.write(f"운용 자본금: {cur_sym}{format_currency(initial_budget_val, m_code)} / G값: {s.get('G', 10)} / 밴드: {band_pct:.0f}% / 적립액: {cur_sym}{format_currency(s.get('periodic_accumulation', 0), m_code)}")
 
                 # [ADD] 전략 선택 버튼 (사이드바 연동)
                 if st.button("🎯 이 전략을 작업 대상으로 선택", key=f"sel_target_{m_code}_{stype}_{sym}_{disp_name}", width='stretch', type="primary"):
@@ -1380,8 +1491,18 @@ with tab_analysis:
                 start_dt = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
                 
                 # ActiveBroker가 US가 아닐 수 있으므로 명시적 생성 또는 확인
-                hist_broker = ActiveBroker if market_code == "US" else get_active_broker_instance("US")
-                ex_history = hist_broker.get_exchange_rate_history(start_dt, end_dt)
+                # 세션 상태 캐싱 (1시간)
+                ex_history_key = f"ex_history_{market_code}"
+                last_ex_history_time_key = f"last_ex_history_time_{market_code}"
+                now_ts = time.time()
+                
+                if ex_history_key not in st.session_state or now_ts - st.session_state.get(last_ex_history_time_key, 0) > 3600:
+                    hist_broker = ActiveBroker if market_code == "US" else get_active_broker_instance("US")
+                    ex_history = hist_broker.get_exchange_rate_history(start_dt, end_dt)
+                    st.session_state[ex_history_key] = ex_history
+                    st.session_state[last_ex_history_time_key] = now_ts
+                else:
+                    ex_history = st.session_state[ex_history_key]
                 
                 if ex_history:
                     df_ex = pd.DataFrame(ex_history)
@@ -1769,8 +1890,15 @@ if mode == "실전 투자":
                             state_obj.current_turn = math.ceil((invested / state_obj.unit_buy_amount) * 10) / 10.0
                         save_state_db(state_obj, market=market_code, strategy_name=strategy_alias) # strategy_name도 함께 저장
                     elif strategy_choice == "VR":
-                        state_obj = VRState(**state_data)
-                        save_state_db(state_obj, market=market_code, strategy_name=strategy_alias) # strategy_name도 함께 저장
+                        import dataclasses
+                        db_avg_price = state_data.get('avg_price', 0.0)
+                        if db_avg_price > 0.0:
+                            valid_keys = {f.name for f in dataclasses.fields(VRState)}
+                            filtered_data = {k: v for k, v in state_data.items() if k in valid_keys}
+                            state_obj = VRState(**filtered_data)
+                            state_obj.total_shares = shares
+                            state_obj.avg_price = avg_price
+                            save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
 
                 # 세션 상태에 저장 (화면 리프레시 대응)
                 st.session_state['live_account'] = {
@@ -1846,19 +1974,23 @@ if mode == "실전 투자":
     # === [신규] 주문 내역 실시간 동기화 (Sync with Kiwoom) ===
     is_active, _ = check_market_active(market_code)
     if is_active:
-        try:
-            logger.info(f"🔄 [Dash] {symbol} 주문 내역 동기화 시작...")
-            broker = ActiveBroker
-            open_orders = broker.fetch_open_orders(symbol)
-            logger.debug(f"Kiwoom API raw open orders response for {symbol}: {open_orders}") # Kiwoom API 미체결 주문 원본 응답 로그
-            # DB와 키움 서버 실시간 동기화
-            sync_open_orders_db(symbol, open_orders)
-            logger.info(f"✅ [Dash] {symbol} 주문 내역 동기화 완료")
-            
-            # 만약 DB에는 없는데 키움에는 있는 주문이 있다면 (수동 주문 등), 
-            # 필요시 여기서 log_order_db를 호출하여 추가할 수도 있습니다.
-        except Exception as e:
-            logger.error(f"주문 내역 동기화 실패: {e}")
+        last_order_sync_key = f"last_order_sync_{market_code}_{symbol}"
+        now_ts = time.time()
+        if now_ts - st.session_state.get(last_order_sync_key, 0) > 60:
+            try:
+                logger.info(f"🔄 [Dash] {symbol} 주문 내역 동기화 시작...")
+                broker = ActiveBroker
+                open_orders = broker.fetch_open_orders(symbol)
+                logger.debug(f"Kiwoom API raw open orders response for {symbol}: {open_orders}") # Kiwoom API 미체결 주문 원본 응답 로그
+                # DB와 키움 서버 실시간 동기화
+                sync_open_orders_db(symbol, open_orders)
+                st.session_state[last_order_sync_key] = now_ts
+                logger.info(f"✅ [Dash] {symbol} 주문 내역 동기화 완료")
+                
+                # 만약 DB에는 없는데 키움에는 있는 주문이 있다면 (수동 주문 등), 
+                # 필요시 여기서 log_order_db를 호출하여 추가할 수도 있습니다.
+            except Exception as e:
+                logger.error(f"주문 내역 동기화 실패: {e}")
 
     # === [신규] 주문 계획 확인 및 실행 영역 ===
     if st.session_state.planned_orders:
@@ -2260,100 +2392,171 @@ if mode == "실전 투자":
         if state_data:
             try:
                 # 상태 변수 추출
+                initial_budget_val = state_data.get('initial_budget', 0.0)
                 current_v = state_data.get('cycle_V', 0.0) # 이번 사이클 목표 V
                 last_pool = state_data.get('pool', 0.0)    # 직전 Pool
-                current_shares = state_data.get('total_shares', 0.0) # (DB엔 없으므로 Live data 쓰거나 계산 필요하지만, VRState dataclass엔 없음)
+                if current_v == 0.0 and initial_budget_val > 0:
+                    current_v = initial_budget_val
+                if last_pool == 0.0 and initial_budget_val > 0:
+                    last_pool = initial_budget_val
+                current_shares = state_data.get('total_shares', 0.0)
                 # VRState에는 shares가 없고 Pool과 V만 관리됨. Shares는 실시간 잔고로 파악해야 함.
                 
                 # Live 정보가 있으면 그것을 우선 사용
+                db_shares = state_data.get('total_shares', 0.0)
                 if 'live_account' in st.session_state and st.session_state['live_account'].get('symbol') == symbol:
-                    live_shares = st.session_state['live_account'].get('shares', 0.0)
-                    live_pool = st.session_state['live_account'].get('pool', last_pool)
+                    live_shares = st.session_state['live_account'].get('shares', db_shares)
+                    live_pool = last_pool
                     current_price = st.session_state['live_account'].get('current_price', 0.0)
                 else:
-                    live_shares = 0
+                    live_shares = db_shares
                     live_pool = last_pool
-                    current_price = 0
+                    current_price = 0.0
 
                 # 밴드 계산 (사이드바 설정값 사용 - 주의: DB에 저장된 설정이 아님)
                 # 실제로는 Config도 DB에 저장하거나 해야 하지만, 여기선 사이드바 값 사용
                 low_band = current_v * (1 - (vr_band_pct / 100.0))
                 high_band = current_v * (1 + (vr_band_pct / 100.0))
                 
-                # 현재 평가금 (E)
-                current_eval = (live_shares * current_price) + live_pool
+                # 현재 평가금 (E) - [공식 수정] 공식문서(strategy_formula.md 105라인) 기준 E는 주식 평가액 단독입니다.
+                current_eval = (live_shares * current_price)
 
-                col_vr1, col_vr2 = st.columns(2)
-                with col_vr1:
-                    st.markdown(f"""
-                    **현재 상태 (Running)**
-                    - 목표 밸류 (V): **{currency_symbol}{format_currency(current_v, market_code)}**
-                    - 현재 평가금 (E): **{currency_symbol}{format_currency(current_eval, market_code)}**
-                    - 밴드 범위: ({vr_band_pct}%) ***{currency_symbol}{format_currency(low_band, market_code)} ~ {currency_symbol}{format_currency(high_band, market_code)}***
-                    """)
-                with col_vr2:
-                    # 밴드 위치 시각화
-                    if current_v > 0:
-                        pos_pct = (current_eval - current_v) / current_v * 100
-                        st.metric("밴드 위치 (E vs V)", f"{pos_pct:+.2f}%", 
-                                  delta="범위 벗어남" if abs(pos_pct) > vr_band_pct else "범위 안에 있음")
+                mode_val = state_data.get('mode', 'RUNNING')
+                if mode_val == 'BOOTSTRAP':
+                    # === 초기 빌드업 (Bootstrap) 전용 뷰 렌더링 ===
+                    b_days = state_data.get('bootstrap_days', 10)
+                    b_count = state_data.get('bootstrap_day_count', 0)
+                    b_order_amt = state_data.get('bootstrap_order_amount', 0.0)
+                    
+                    st.info(f"⏳ **현재 초기 빌드업(Bootstrap) 단계 진행 중입니다.** ({b_count} / {b_days}일 완료)")
+                    
+                    col_b1, col_b2 = st.columns(2)
+                    with col_b1:
+                        st.markdown(f"""
+                        **📊 빌드업 현황**
+                        - 현재 상태: ⏳ **초기 빌드업 (Bootstrap)**
+                        - 진행 카운트: **{b_count}일** / 총 **{b_days}일**
+                        - 가용 예수금: **{currency_symbol}{format_currency(live_pool, market_code)}**
+                        - 설정 자본금: **{currency_symbol}{format_currency(initial_budget_val, market_code)}**
+                        """)
+                    with col_b2:
+                        qty_est = int(b_order_amt / current_price) if current_price > 0 else 0
+                        st.markdown(f"""
+                        **🛒 일일 분할 매수 계획**
+                        - 1일 목표 매수액: **{currency_symbol}{format_currency(b_order_amt, market_code)}**
+                        - 예상 매수 가격: **{currency_symbol}{format_currency(current_price, market_code)}** (LOC 지정가)
+                        - 예상 매수 수량: **{qty_est}주** (LOC)
+                        """)
+                        
+                    pct_done = min(100.0, float(b_count) / float(b_days))
+                    st.progress(pct_done, text=f"빌드업 진행률 {pct_done:.1f}%")
+                    st.caption("※ 초기 빌드업 기간 동안에는 목표 V 및 실시간 평가금 E는 계산 및 축적되지만, VR 공식에 따른 밴드 리밸런싱 지정가 매수/매도 주문은 나가지 않고 오직 매일 위의 LOC 분할 매수 주문만 자동 제출됩니다.")
+                else:
+                    col_vr1, col_vr2 = st.columns(2)
+                    with col_vr1:
+                        st.markdown(f"""
+                        **현재 상태 (Running)**
+                        - 목표 밸류 (V): **{currency_symbol}{format_currency(current_v, market_code)}**
+                        - 현재 평가금 (E): **{currency_symbol}{format_currency(current_eval, market_code)}**
+                        - 밴드 범위: ({vr_band_pct}%) ***{currency_symbol}{format_currency(low_band, market_code)} ~ {currency_symbol}{format_currency(high_band, market_code)}***
+                        """)
+                    with col_vr2:
+                        # 밴드 위치 시각화
+                        if current_v > 0:
+                            pos_pct = (current_eval - current_v) / current_v * 100
+                            st.metric("밴드 위치 (E vs V)", f"{pos_pct:+.2f}%", 
+                                      delta="범위 벗어남" if abs(pos_pct) > vr_band_pct else "범위 안에 있음")
                 
-                st.divider()
-                st.markdown("##### 🛒 예약 주문 가이드 (Limit Orders)")
-                st.caption(f"보유 수량: {live_shares}주 | 사용 가능 현금: {currency_symbol}{format_currency(live_pool, market_code)} 기준")
-
-                c1, c2 = st.columns(2)
+                # [ADD] VR 실력공식 구성 요소 시각화
+                import math
+                g_coeff = state_data.get('G', 10.0)
+                if g_coeff <= 0: g_coeff = 10.0
+                p_accum = state_data.get('periodic_accumulation', 0.0)
                 
-                # 1. 매수 주문 (Low Band)
-                # Low Band / (Shares + n)
-                # 단, Pool 한도(적립식 75%, 거치 50%, 인출 25%) 체크 필요. 여기선 단순 계산만 보여줌.
-                with c1:
-                    st.markdown("**📉 매수 예약 (지정가)**")
-                    buy_orders = []
-                    pool_limit_ratio = 0.5 # Default
-                    if "적립" in vr_invest_type_disp: pool_limit_ratio = 0.75
-                    elif "인출" in vr_invest_type_disp: pool_limit_ratio = 0.25
-                    
-                    max_use_pool = live_pool * pool_limit_ratio
-                    used_pool = 0.0
-                    
-                    # Pool에서 차감해야 하므로 (LowBand - CurrentPool)로 역산하지 않고
-                    # VR 기본 공식: E = Shares*Price + Pool <= LowBand
-                    # => Price <= (LowBand - Pool) / Shares (X) -> 이건 E 기준
-                    # 라오어 공식: Price = LowBand / (Shares + n)
-                    
-                    # 현금 고려한 공식: LimitPrice = (LowBand - Pool) / (Shares + n) 
-                    # (단, Pool이 변하지 않는다고 가정시. 실제론 매수하면 Pool이 줄어듦)
-                    # 여기서는 dashboard.py 로직 단순화를 위해 기본 라오어 공식 + 현금 보정 적용
-                    
-                    target_val_buy = low_band - live_pool
-                    if target_val_buy > 0:
-                        for n in range(1, 6): # 5호가 정도만 보여줌
-                            limit_price = target_val_buy / (live_shares + n)
-                            if limit_price > 0 and used_pool + limit_price <= max_use_pool:
-                                buy_orders.append({"구분": f"매수 {n}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
-                                used_pool += limit_price
-                        st.table(pd.DataFrame(buy_orders))
-                    else:
-                        st.info("현재 현금이 Low Band보다 많아 추가 매수가 불필요하거나 불가능합니다.")
+                # 다음 사이클 예상 목표 V (V2) 계산 시뮬레이션
+                v2_val = current_v + (live_pool / g_coeff) + ((current_eval - current_v) / (2.0 * math.sqrt(g_coeff))) + p_accum
+                
+                st.markdown("##### 🧮 VR 실력공식 구성 변수 (Skill Formula Components)")
+                formula_df = {
+                    "구분": [
+                        "이전 사이클 목표 밸류 (V1)",
+                        "현재 가용 예수금 (Pool)",
+                        "기울기 계수 (G)",
+                        "현재 주식 평가액 (E)",
+                        "주기별 적립/인출금",
+                        "계산된 다음 목표 밸류 (V2)"
+                    ],
+                    "변수명": ["V1", "Pool", "G", "E", "Contribution", "V2"],
+                    "값 / 수치": [
+                        f"{currency_symbol}{format_currency(current_v, market_code)}",
+                        f"{currency_symbol}{format_currency(live_pool, market_code)}",
+                        f"{g_coeff:.0f}",
+                        f"{currency_symbol}{format_currency(current_eval, market_code)}",
+                        f"{currency_symbol}{format_currency(p_accum, market_code)}",
+                        f"{currency_symbol}{format_currency(v2_val, market_code)}"
+                    ],
+                    "수식 기여분": [
+                        "기준값",
+                        f"+{currency_symbol}{format_currency(live_pool / g_coeff, market_code)}",
+                        "수축/이완 조절",
+                        f"{'+' if (current_eval - current_v) >= 0 else ''}{currency_symbol}{format_currency((current_eval - current_v) / (2.0 * math.sqrt(g_coeff)), market_code)}",
+                        f"+{currency_symbol}{format_currency(p_accum, market_code)}",
+                        "다음 사이클 시작 시 갱신값"
+                    ]
+                }
+                st.table(formula_df)
+                
+                if mode_val != 'BOOTSTRAP':
+                    st.divider()
+                    st.markdown("##### 🛒 예약 주문 가이드 (Limit Orders)")
+                    st.caption(f"보유 수량: {live_shares}주 | 사용 가능 현금: {currency_symbol}{format_currency(live_pool, market_code)} 기준")
 
-                # 2. 매도 주문 (High Band)
-                # High Band / (Shares - n)
-                with c2:
-                    st.markdown("**📈 매도 예약 (지정가)**")
-                    sell_orders = []
-                    target_val_sell = high_band - live_pool
+                    c1, c2 = st.columns(2)
                     
-                    if target_val_sell > 0 and live_shares > 0:
-                        for n in range(0, min(5, int(live_shares))):
-                            if (live_shares - n) > 0:
-                                limit_price = target_val_sell / (live_shares - n)
-                                sell_orders.append({"구분": f"매도 {n+1}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
-                        st.table(pd.DataFrame(sell_orders))
-                    elif target_val_sell <= 0:
-                         st.warning("현재 현금이 이미 High Band를 초과했습니다. 즉시 리밸런싱(매도)이 필요할 수 있습니다.")
-                    else:
-                        st.info("보유 수량이 없습니다.")
+                    # 1. 매수 주문 (Low Band)
+                    with c1:
+                        st.markdown("**📉 매수 예약 (지정가)**")
+                        buy_orders = []
+                        pool_limit_ratio = 0.5 # Default
+                        if "적립" in vr_invest_type_disp: pool_limit_ratio = 0.75
+                        elif "인출" in vr_invest_type_disp: pool_limit_ratio = 0.25
+                        
+                        max_use_pool = live_pool * pool_limit_ratio
+                        used_pool = 0.0
+                        
+                        target_val_buy = low_band - live_pool
+                        if target_val_buy > 0:
+                            for n in range(1, 6): # 5호가 정도만 보여줌
+                                limit_price = target_val_buy / (live_shares + n)
+                                if limit_price > 0 and used_pool + limit_price <= max_use_pool:
+                                    buy_orders.append({"구분": f"매수 {n}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
+                                    used_pool += limit_price
+                            if buy_orders:
+                                st.table(pd.DataFrame(buy_orders))
+                            else:
+                                st.info("사용 한도를 초과해 표시할 매수 주문이 없습니다.")
+                        else:
+                            st.info("현재 현금이 Low Band보다 많아 추가 매수가 불필요하거나 불가능합니다.")
+
+                    # 2. 매도 주문 (High Band)
+                    with c2:
+                        st.markdown("**📈 매도 예약 (지정가)**")
+                        sell_orders = []
+                        target_val_sell = high_band - live_pool
+                        
+                        if target_val_sell > 0 and live_shares > 0:
+                            for n in range(0, min(5, int(live_shares))):
+                                if (live_shares - n) > 0:
+                                    limit_price = target_val_sell / (live_shares - n)
+                                    sell_orders.append({"구분": f"매도 {n+1}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
+                            if sell_orders:
+                                st.table(pd.DataFrame(sell_orders))
+                            else:
+                                st.info("보유 수량이 부족합니다.")
+                        elif target_val_sell <= 0:
+                             st.warning("현재 현금이 이미 High Band를 초과했습니다. 즉시 리밸런싱(매도)이 필요할 수 있습니다.")
+                        else:
+                            st.info("보유 수량이 없습니다.")
 
                 # === 주문 내역 조회 (Order History) ===
                 st.divider()
