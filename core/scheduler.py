@@ -419,6 +419,32 @@ def job_market_open(market: str = "US"):
         handle_api_error_tracking(market, e)
         logger.error(f"[{market}] Job Market Open Failed: {e}", exc_info=True)
 
+def job_vr_bootstrap_market_buys(market: str = "US"):
+    """정규장 시작 30분 후 실행할 VR Bootstrap 시장가 매수 작업"""
+    if not is_market_active_for_orders(market):
+        logger.info(f"⏸️ [VR-Bootstrap-{market}] 시장 운영 시간 외이므로 작업을 건너뜁니다.")
+        return
+    if get_config("scheduler_status") != "running":
+        logger.info(f"⏸️ [VR-Bootstrap-{market}] 스케줄러가 정지 상태입니다.")
+        return
+
+    # 휴장 확인
+    if market == "KR" and get_config("kr_market_opnd_yn") == "N":
+        return
+    if market == "US" and get_config("us_market_opnd_yn") == "N":
+        return
+
+    logger.info(f"🔔 [{market}] 정규장 시작 30분 후 VR Bootstrap 시장가 매수를 시작합니다.")
+    
+    broker = KiwoomKrBroker() if market == "KR" else KiwoomUsBroker()
+    try:
+        # BOOTSTRAP_BUY_ONLY 필터를 적용하여 실행
+        run_vr_strategies(market=market, check_existing=True, order_filter="BOOTSTRAP_BUY_ONLY", broker=broker)
+        logger.info(f"[{market}] VR Bootstrap 매수 주문 제출 완료.")
+    except Exception as e:
+        handle_api_error_tracking(market, e)
+        logger.error(f"[{market}] Job VR Bootstrap Market Buys Failed: {e}", exc_info=True)
+
 def job_kr_market_late_open():
     """한국 시장 개장 1시간 후(10:00): 신규 차수 진입 및 초기 매수 실행"""
     market = "KR"
@@ -755,6 +781,12 @@ def main():
         id='us_market_open',
         name='미국장 개장 후 주문'
     )
+    scheduler.add_job(
+        lambda: job_vr_bootstrap_market_buys(market="US"),
+        trigger=CronTrigger(hour=10, minute=0, day_of_week='mon-fri', timezone=ny_tz),
+        id='us_vr_bootstrap_buys',
+        name='미국장 30분 후 VR Bootstrap 매수'
+    )
 
     # 2. 한국 시장 스케줄
     scheduler.add_job(
@@ -762,6 +794,12 @@ def main():
         trigger=CronTrigger(hour=9, minute=10, day_of_week='mon-fri', timezone=kr_tz), # 09:00 개장 10분 후
         id='kr_market_open',
         name='한국장 개장 후 주문'
+    )
+    scheduler.add_job(
+        lambda: job_vr_bootstrap_market_buys(market="KR"),
+        trigger=CronTrigger(hour=9, minute=30, day_of_week='mon-fri', timezone=kr_tz),
+        id='kr_vr_bootstrap_buys',
+        name='한국장 30분 후 VR Bootstrap 매수'
     )
     
     # 한국 시장 개장 1시간 후 신규 진입 스케줄 추가

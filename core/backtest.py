@@ -283,14 +283,29 @@ def run_backtest(
 
     engine = None
     if strategy_type == "VR":
+        p_acc = kwargs.get("periodic_accumulation", 0.0)
+        invest_type = kwargs.get("invest_type", "")
+        
+        # 기본 추천 한도 결정
+        def_limit_pct = 50.0
+        if str(invest_type) == "적립식" or str(invest_type) == "Accumulation" or p_acc > 0:
+            def_limit_pct = 75.0
+        elif str(invest_type) == "인출식" or str(invest_type) == "Withdrawal" or p_acc < 0:
+            def_limit_pct = 25.0
+            
+        pool_limit_pct = kwargs.get("pool_limit_pct", def_limit_pct)
+
         config = VRConfig(
             symbol=symbol,
             strategy_type="VR",
             save_path=temp_state_path,
+            initial_budget=initial_cash,
             G=kwargs.get("G", 10.0),
             band_low_pct=kwargs.get("band_low_pct", 85.0),
             band_high_pct=kwargs.get("band_high_pct", 115.0),
-            periodic_accumulation=kwargs.get("periodic_accumulation", 0.0)
+            periodic_accumulation=p_acc,
+            investment_type="accumulation" if p_acc > 0 or invest_type == "적립식" else "deferment",
+            pool_limit_pct=pool_limit_pct
         )
         engine = ValueRebalancingEngine(config, broker)
         
@@ -363,19 +378,8 @@ def run_backtest(
     
     # --- VR POOL 사용 한도 비율 설정 ---
     vr_limit_ratio = 1.0
-    if strategy_type == "VR":
-        # invest_type이나 periodic_accumulation을 통해 투자 방식 추론
-        # 적립식(Accumulation): 75%, 거치식(Deferment): 50%, 인출식(Withdrawal): 25%
-        p_acc = kwargs.get("periodic_accumulation", 0.0)
-        invest_type = kwargs.get("invest_type", "")
-        
-        if str(invest_type) == "적립식" or str(invest_type) == "Accumulation" or p_acc > 0:
-            vr_limit_ratio = 0.75
-        elif str(invest_type) == "인출식" or str(invest_type) == "Withdrawal" or p_acc < 0:
-            vr_limit_ratio = 0.25
-        else:
-            # 거치식 (0원 이거나 명시적 거치식)
-            vr_limit_ratio = 0.50
+    if strategy_type == "VR" and engine is not None:
+        vr_limit_ratio = engine.config.pool_limit_pct / 100.0
 
     while True:
         current_date = broker._get_current_date()

@@ -297,6 +297,13 @@ class KiwoomUsBroker(Broker):
                 api_url = f"https://api.exchangerate.host/live?access_key={ex_key}&symbols=KRW"
                 logger.info(f"[ExchangeRate] Exchangerate.host API를 통한 환율 조회를 시도합니다. (오늘 호출 횟수: {call_count + 1}/3)")
                 response = requests.get(api_url, timeout=5.0)
+                
+                # [DEBUG LOG ADDED] API 요청 세부사항 및 원본 응답 내용 로깅
+                logger.debug(f"[ExchangeRate Debug] API URL: {api_url.replace(ex_key, '***HIDDEN***')}")
+                logger.debug(f"[ExchangeRate Debug] Status Code: {response.status_code}")
+                logger.debug(f"[ExchangeRate Debug] Response Headers: {dict(response.headers)}")
+                logger.debug(f"[ExchangeRate Debug] Response Text: {response.text}")
+                
                 if response.status_code == 200:
                     res_data = response.json()
                     if res_data.get("success"):
@@ -314,6 +321,8 @@ class KiwoomUsBroker(Broker):
                             }
                             self._exchange_rate_cache = (today_str, res_dict)
                             return res_dict
+                    else:
+                        logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API success 필드가 False입니다. Error Info: {res_data.get('error')}")
                 logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host 응답이 올바르지 않습니다. (Status: {response.status_code})")
             except Exception as e:
                 logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API 호출 중 오류 발생: {e}. 키움 API로 대체하여 조회합니다.")

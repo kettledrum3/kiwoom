@@ -817,15 +817,27 @@ with st.sidebar:
             # [신규] 0일차 기존 잔고 편입 체크박스 옵션 제공 (DB 상태가 없거나 수량이 0인 신규 세팅 시 사용)
             include_existing = st.checkbox("기존 잔고 편입 (0일차)", value=False, key=f"{m_lower}_{widget_suffix}_vr_inc_exist", help="체크 시 계좌에 이미 보유 중인 주식 수량과 평단가를 이 전략의 0일차 시작 잔고로 편입합니다.")
             
-            # [신규] 초기 빌드업 일수 (영업일 수 기준)
-            bootstrap_days = st.slider("초기 빌드업 일수 (일)", 5, 20, 10, key=f"{m_lower}_{widget_suffix}_vr_boot_days", help="전략 기동 시 실제 VR 지정가 분할 매매 예약을 시작하기 전, 안전하게 분할 매수를 집행하여 초기 주식 비중을 확보할 영업일 수입니다.")
+            # [수정] 초기 빌드업 일수 슬라이더를 Pool 사용한도 슬라이더로 변경
+            def_limit_pct = 50.0
+            if v_type_disp == "적립식": def_limit_pct = 75.0
+            elif v_type_disp == "인출식": def_limit_pct = 25.0
+            
+            if d_state and d_state.get('pool_limit_pct') is not None:
+                def_limit_pct = float(d_state.get('pool_limit_pct'))
+
+            pool_limit_pct = st.slider(
+                "Pool 사용한도 (%)", 
+                25, 75, int(def_limit_pct), 
+                key=f"{m_lower}_{widget_suffix}_vr_pool_limit", 
+                help="전략에서 사용할 수 있는 최대 Pool 한도 비율입니다. (추천: 적립식 75%, 거치식 50%, 인출식 25%)"
+            )
             
             return {
                 "mode": internal_mode, "strategy": s_choice, "alias": s_alias, "symbol": s_symbol, "pool": def_pool,
                 "g_value": g_val, "band_pct": b_pct, "periodic_amt": p_amt,
                 "initial_cash": i_cash, "investment_type": v_type, "freq": v_freq, "invest_type_disp": v_type_disp,
                 "include_existing": include_existing,
-                "bootstrap_days": bootstrap_days,
+                "pool_limit_pct": pool_limit_pct,
                 "fetch_days": f_days, "fee_rate": f_rate, "tax_rate": t_rate
             }
 
@@ -964,15 +976,52 @@ with st.sidebar:
                 # 운용자본금을 모두 pool에 부여
                 initial_pool = initial_cash
                 
-                # V 계산: pool(초기자본금) + 편입한 주식 가치
-                initial_V = initial_pool + stock_value
+                # V 계산: 0 + pool/G + E/(2*sqrt(G))
+                import math
+                initial_V = (initial_pool / vr_g_value) + (stock_value / (2.0 * math.sqrt(vr_g_value)))
                 
-                pool_limit_ratio = 0.5
-                if "accumulation" in vr_investment_type: pool_limit_ratio = 0.75
-                elif "withdrawal" in vr_investment_type: pool_limit_ratio = 0.25
+                vr_pool_limit_pct = active_settings.get("pool_limit_pct", 50.0)
                 
-                bootstrap_order_amt = (initial_pool * pool_limit_ratio) / vr_bootstrap_days
-                new_mode = "RUNNING" if vr_include_existing else "BOOTSTRAP"
+                # 가변 Bootstrap 조건 및 진입 여부 판별
+                low_band = initial_V * ((100.0 - vr_band_pct) / 100.0)
+                usable_pool = initial_pool * (vr_pool_limit_pct / 100.0)
+                
+                mode = "RUNNING"
+                bootstrap_days = 0
+                bootstrap_order_amt = 0.0
+                
+                if usable_pool > low_band:
+                    # 실시간 주가 확인
+                    price = broker.get_price(symbol)
+                    if price <= 0:
+                        price = broker.get_previous_close(symbol)
+                    
+                    if price > 0:
+                        # 1) 10등분 시도
+                        amt_10 = usable_pool / 10.0
+                        qty_10 = int(amt_10 / price)
+                        if qty_10 >= 2:
+                            mode = "BOOTSTRAP"
+                            bootstrap_days = 10
+                            bootstrap_order_amt = amt_10
+                        else:
+                            # 2) 5등분 시도
+                            amt_5 = usable_pool / 5.0
+                            qty_5 = int(amt_5 / price)
+                            if qty_5 >= 2:
+                                mode = "BOOTSTRAP"
+                                bootstrap_days = 5
+                                bootstrap_order_amt = amt_5
+                            else:
+                                # 3) 매수 미진행 -> 즉시 RUNNING 진입
+                                mode = "RUNNING"
+                                bootstrap_days = 0
+                                bootstrap_order_amt = 0.0
+                    else:
+                        # 주가 조회 실패 시, 10등분으로 가정한 뒤 BOOTSTRAP 모드로 시작합니다 (안전한 폴백)
+                        mode = "BOOTSTRAP"
+                        bootstrap_days = 10
+                        bootstrap_order_amt = usable_pool / 10.0
                 
                 new_state = VRState(
                     symbol=symbol,
@@ -989,14 +1038,15 @@ with st.sidebar:
                     cycle_start_pool=initial_pool,
                     total_shares=initial_shares,
                     avg_price=initial_avg_price,
-                    mode=new_mode,
-                    bootstrap_days=vr_bootstrap_days,
+                    mode=mode,
+                    bootstrap_days=bootstrap_days,
                     bootstrap_day_count=0,
                     bootstrap_order_amount=bootstrap_order_amt,
                     G=vr_g_value,
                     band_low_pct=100.0 - vr_band_pct,
                     band_high_pct=100.0 + vr_band_pct,
-                    investment_type=vr_investment_type
+                    investment_type=vr_investment_type,
+                    pool_limit_pct=vr_pool_limit_pct
                 )
             
             # DB에 저장
@@ -2422,8 +2472,33 @@ if mode == "실전 투자":
                 current_eval = (live_shares * current_price)
 
                 mode_val = state_data.get('mode', 'RUNNING')
+                
+                # 구버전 호환용 (bootstrap_days 필드가 없거나 0 인데 mode가 BOOTSTRAP 인 구버전 잔재 자가 치유)
+                if mode_val == 'BOOTSTRAP' and state_data.get('bootstrap_days', 0) == 0:
+                    from core.database import save_state_db
+                    from core.cavr import VRState
+                    import math
+                    
+                    state_data['mode'] = 'RUNNING'
+                    G_val = state_data.get('G', 10.0)
+                    if G_val <= 0: G_val = 10.0
+                    E_val = state_data.get('total_shares', 0.0) * state_data.get('avg_price', 0.0)
+                    init_pool = state_data.get('pool', initial_budget_val)
+                    
+                    new_V = (init_pool / G_val) + (E_val / (2.0 * math.sqrt(G_val)))
+                    state_data['V'] = new_V
+                    state_data['cycle_V'] = new_V
+                    state_data['cycle_start_pool'] = init_pool
+                    state_data['last_E'] = E_val
+                    
+                    recovered_state = VRState(**state_data)
+                    save_state_db(recovered_state, market=market_code, strategy_name=strategy_alias)
+                    st.toast("🔧 [Self-Healing] 구버전 BOOTSTRAP 전략이 RUNNING 모드로 자동 복구 및 즉시 전환되었습니다.")
+                    time.sleep(1)
+                    st.rerun()
+
                 if mode_val == 'BOOTSTRAP':
-                    # === 초기 빌드업 (Bootstrap) 전용 뷰 렌더링 ===
+                    # === 신버전 초기 빌드업 (Bootstrap) 전용 뷰 렌더링 ===
                     b_days = state_data.get('bootstrap_days', 10)
                     b_count = state_data.get('bootstrap_day_count', 0)
                     b_order_amt = state_data.get('bootstrap_order_amount', 0.0)
@@ -2442,15 +2517,15 @@ if mode == "실전 투자":
                     with col_b2:
                         qty_est = int(b_order_amt / current_price) if current_price > 0 else 0
                         st.markdown(f"""
-                        **🛒 일일 분할 매수 계획**
+                        **🛒 일일 시장가 매수 계획**
                         - 1일 목표 매수액: **{currency_symbol}{format_currency(b_order_amt, market_code)}**
-                        - 예상 매수 가격: **{currency_symbol}{format_currency(current_price, market_code)}** (LOC 지정가)
-                        - 예상 매수 수량: **{qty_est}주** (LOC)
+                        - 예상 매수 가격: **{currency_symbol}{format_currency(current_price, market_code)}**
+                        - 예상 매수 수량: **{qty_est}주** (장 시작 30분 후 시장가 제출)
                         """)
                         
-                    pct_done = min(100.0, float(b_count) / float(b_days))
-                    st.progress(pct_done, text=f"빌드업 진행률 {pct_done:.1f}%")
-                    st.caption("※ 초기 빌드업 기간 동안에는 목표 V 및 실시간 평가금 E는 계산 및 축적되지만, VR 공식에 따른 밴드 리밸런싱 지정가 매수/매도 주문은 나가지 않고 오직 매일 위의 LOC 분할 매수 주문만 자동 제출됩니다.")
+                    pct_done = min(100.0, float(b_count) / float(b_days) * 100.0) if b_days > 0 else 100.0
+                    st.progress(pct_done / 100.0, text=f"빌드업 진행률 {pct_done:.1f}%")
+                    st.caption("※ 초기 빌드업 기간 동안에는 목표 V 및 실시간 평가금 E는 계산되지만, 밴드 리밸런싱 지정가 매수/매도 주문 대신 매일 정규장 개장 30분 후 시장가로 매수 주문이 자동으로 집행됩니다.")
                 else:
                     col_vr1, col_vr2 = st.columns(2)
                     with col_vr1:
@@ -2506,9 +2581,40 @@ if mode == "실전 투자":
                 }
                 st.table(formula_df)
                 
-                if mode_val != 'BOOTSTRAP':
+                if mode_val == 'BOOTSTRAP':
+                    st.markdown("##### ⏳ 초기 분할매수모드 (Bootstrap) 상세 정보")
+                    b_days = state_data.get('bootstrap_days', 10)
+                    b_count = state_data.get('bootstrap_day_count', 0)
+                    b_order_amt = state_data.get('bootstrap_order_amount', 0.0)
+                    
+                    bootstrap_info = {
+                        "설정 항목": ["진행 상태", "총 목표 일수", "누적 진행 일수", "일일 매수 계획 금액", "가용 풀 사용 한도 (%)"],
+                        "값 / 수치": [
+                            "⏳ 진행 중 (BOOTSTRAP)",
+                            f"{b_days}일",
+                            f"{b_count}일",
+                            f"{currency_symbol}{format_currency(b_order_amt, market_code)}",
+                            f"{state_data.get('pool_limit_pct', 50.0):.1f}%"
+                        ]
+                    }
+                    st.table(pd.DataFrame(bootstrap_info))
+                
+                if mode_val in ['RUNNING', 'BOOTSTRAP']:
                     st.divider()
                     st.markdown("##### 🛒 예약 주문 가이드 (Limit Orders)")
+                    if mode_val == 'BOOTSTRAP':
+                        b_days = state_data.get('bootstrap_days', 10)
+                        b_count = state_data.get('bootstrap_day_count', 0)
+                        b_order_amt = state_data.get('bootstrap_order_amount', 0.0)
+                        qty_est = int(b_order_amt / current_price) if current_price > 0 else 0
+                        
+                        st.warning(
+                            f"⏳ **초기 분할매수모드(Bootstrap) 진행 상황**: "
+                            f"**{b_days}회 중 {b_count + 1}회차 매수 예정** (현재 {b_count}회 완료)  \n"
+                            f"💰 **일일 매수 금액**: **{currency_symbol}{format_currency(b_order_amt, market_code)}** | "
+                            f"📦 **예상 매수가능 수량**: **{qty_est}주** (현재가 {currency_symbol}{format_currency(current_price, market_code)} 기준)  \n"
+                            f"⚠️ *Bootstrap 기간에는 매일 개장 30분 후에 시장가 주문이 자동으로 제출됩니다. 아래 지정가 예약은 참고용이며 자동 제출되지 않습니다.*"
+                        )
                     st.caption(f"보유 수량: {live_shares}주 | 사용 가능 현금: {currency_symbol}{format_currency(live_pool, market_code)} 기준")
 
                     c1, c2 = st.columns(2)
@@ -2517,9 +2623,13 @@ if mode == "실전 투자":
                     with c1:
                         st.markdown("**📉 매수 예약 (지정가)**")
                         buy_orders = []
-                        pool_limit_ratio = 0.5 # Default
-                        if "적립" in vr_invest_type_disp: pool_limit_ratio = 0.75
-                        elif "인출" in vr_invest_type_disp: pool_limit_ratio = 0.25
+                        pool_limit_ratio = state_data.get('pool_limit_pct')
+                        if pool_limit_ratio is not None:
+                            pool_limit_ratio = pool_limit_ratio / 100.0
+                        else:
+                            pool_limit_ratio = 0.5 # Default
+                            if "적립" in vr_invest_type_disp: pool_limit_ratio = 0.75
+                            elif "인출" in vr_invest_type_disp: pool_limit_ratio = 0.25
                         
                         max_use_pool = live_pool * pool_limit_ratio
                         used_pool = 0.0
@@ -2796,7 +2906,8 @@ elif mode == "백테스트":
                     "initial_budget": float(initial_cash),
                     "periodic_accumulation": float(vr_periodic_amt),
                     "contribution_frequency": vr_freq,
-                    "investment_type": vr_investment_type
+                    "investment_type": vr_investment_type,
+                    "pool_limit_pct": float(active_settings.get("pool_limit_pct", 50.0))
                 })
 
             result_text, result_df, trade_history_df = run_backtest(**backtest_kwargs)

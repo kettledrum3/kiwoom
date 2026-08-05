@@ -642,6 +642,7 @@ class VRConfig(BaseConfig):
     band_high_pct: float = 115.0
     periodic_accumulation: float = 250.0
     investment_type: str = "accumulation"
+    pool_limit_pct: float = 50.0
 
 @dataclass
 class BaseState:
@@ -693,6 +694,8 @@ class VRState(BaseState):
     V: float = 0.0
     pool: float = 0.0
     last_E: float = 0.0
+    total_shares: float = 0.0         # [추가] 보유 수량
+    avg_price: float = 0.0            # [추가] 평균 매입 단가
     periodic_accumulation: float = 0.0
     current_price: float = 0.0        # [추가] 실시간 현재가 캐시
     initial_budget: float = 0.0
@@ -701,9 +704,10 @@ class VRState(BaseState):
     band_high_pct: float = 115.0       # 상단 밴드
     investment_type: str = "accumulation" # 투자 방식
     freq: str = "격주 금요일 (2주)"       # [추가] 적립/인출 주기
+    pool_limit_pct: float = 50.0       # [추가] Pool 사용 한도 비율
     
     # 모드 관리
-    mode: str = 'BOOTSTRAP'
+    mode: str = 'RUNNING'
     bootstrap_days: int = 10
     bootstrap_day_count: int = 0
     bootstrap_order_amount: float = 0.0
@@ -1730,6 +1734,8 @@ class ValueRebalancingEngine:
             self.config.band_high_pct = self.state.band_high_pct
         if hasattr(self.state, 'investment_type'):
             self.config.investment_type = self.state.investment_type
+        if hasattr(self.state, 'pool_limit_pct') and self.state.pool_limit_pct > 0:
+            self.config.pool_limit_pct = self.state.pool_limit_pct
             
     def _is_already_ordered(self, side: str, price: float, qty: int, open_orders: list) -> bool:
         """VR용 중복 주문 확인 및 소모 (Preview용)"""
@@ -1762,13 +1768,55 @@ class ValueRebalancingEngine:
         # 1. 운용자본금이 주어져 있다면 그것이 Pool이 됨
         initial_pool = self.config.initial_budget if self.config.initial_budget > 0 else cash_pool
         
-        # 2. 엔진 레벨 기동 시에는 기존 잔고가 있으면 편입하는 것을 기본으로 함
-        initial_shares = shares
-        initial_avg_price = avg_price
-        stock_value = eval_amt
+        # 2. 초기 잔고 계산 (E = 잔고 * 평균매입단가)
+        E = shares * avg_price
         
-        # 3. 최초 목표 V = pool + stock_value
-        initial_V = initial_pool + stock_value
+        # 3. 1회차 V_2 계산 공식 적용: V_1 = 0, P = initial_pool, G = G
+        # V_2 = 0 + Pool/G + E / (2 * sqrt(G))
+        G = self.config.G if self.config.G > 0 else 10.0
+        initial_V = (initial_pool / G) + (E / (2.0 * math.sqrt(G)))
+
+        # 4. 가변 Bootstrap 조건 및 진입 여부 판별
+        low_band = initial_V * (self.config.band_low_pct / 100.0)
+        usable_pool = initial_pool * (self.config.pool_limit_pct / 100.0)
+        
+        mode = "RUNNING"
+        bootstrap_days = 0
+        bootstrap_day_count = 0
+        bootstrap_order_amount = 0.0
+
+        if usable_pool > low_band:
+            # 주가 확인
+            price = self.broker.get_price(self.config.symbol)
+            if price <= 0:
+                price = self.broker.get_previous_close(self.config.symbol)
+            
+            if price > 0:
+                # 1) 10등분 시도
+                amt_10 = usable_pool / 10.0
+                qty_10 = int(amt_10 / price)
+                if qty_10 >= 2:
+                    mode = "BOOTSTRAP"
+                    bootstrap_days = 10
+                    bootstrap_order_amount = amt_10
+                else:
+                    # 2) 5등분 시도
+                    amt_5 = usable_pool / 5.0
+                    qty_5 = int(amt_5 / price)
+                    if qty_5 >= 2:
+                        mode = "BOOTSTRAP"
+                        bootstrap_days = 5
+                        bootstrap_order_amount = amt_5
+                    else:
+                        # 3) 매수 미진행 -> 즉시 RUNNING 진입
+                        mode = "RUNNING"
+                        bootstrap_days = 0
+                        bootstrap_order_amount = 0.0
+            else:
+                # 주가 조회 실패 시, 10등분으로 가정한 뒤 BOOTSTRAP 모드로 시작합니다 (안전한 폴백)
+                mode = "BOOTSTRAP"
+                bootstrap_days = 10
+                bootstrap_order_amount = usable_pool / 10.0
 
         return VRState(
             symbol=self.config.symbol,
@@ -1777,17 +1825,21 @@ class ValueRebalancingEngine:
             market=self.config.market,
             V=initial_V,
             pool=initial_pool,
-            last_E=stock_value,           # E는 공식 기준 주식 평가액 단독
+            last_E=E,
             initial_budget=self.config.initial_budget if self.config.initial_budget > 0 else initial_V,
-            cycle_V=initial_V,           # 0일차/1일차에 목표 V가 0원으로 뜨는 현상 예방
+            cycle_V=initial_V,
             cycle_start_pool=initial_pool,
-            total_shares=initial_shares,
-            avg_price=initial_avg_price,
-            mode="RUNNING",
-            G=self.config.G,
+            total_shares=shares,
+            avg_price=avg_price,
+            mode=mode,
+            bootstrap_days=bootstrap_days,
+            bootstrap_day_count=bootstrap_day_count,
+            bootstrap_order_amount=bootstrap_order_amount,
+            G=G,
             band_low_pct=self.config.band_low_pct,
             band_high_pct=self.config.band_high_pct,
-            investment_type=self.config.investment_type
+            investment_type=self.config.investment_type,
+            pool_limit_pct=self.config.pool_limit_pct
         )
 
     def _update_V_skill(self, E: float, contribution: float = 0.0) -> float:
@@ -1863,59 +1915,70 @@ class ValueRebalancingEngine:
             elif not preview:
                 save_state(self.state, self.config.save_path)
 
-        # 3. BOOTSTRAP 모드 처리 (초기 분할 빌드업 실행)
+        # 3. BOOTSTRAP 모드 처리
         if self.state.mode == 'BOOTSTRAP':
-            # 빌드업 1일당 매수 예정 금액 계산
-            if self.state.bootstrap_order_amount <= 0:
-                pool_limit_ratio = 0.5
-                if "accumulation" in self.config.investment_type: pool_limit_ratio = 0.75
-                elif "withdrawal" in self.config.investment_type: pool_limit_ratio = 0.25
+            if order_filter != "BOOTSTRAP_BUY_ONLY":
+                # 일반 정규장 개장 배치 등에서는 Bootstrap 매수 주문을 제출하지 않고 대기합니다 (장 시작 30분 후 실행).
+                logger.info(f"⏳ [{symbol}] 현재 초기 빌드업(Bootstrap) 단계입니다. 장 시작 30분 후 시장가 주문 배치를 기다립니다.")
+                if preview: return []
+                return
                 
-                total_target_investment = self.state.initial_budget * pool_limit_ratio
-                b_days = self.state.bootstrap_days if self.state.bootstrap_days > 0 else 10
-                self.state.bootstrap_order_amount = total_target_investment / b_days
-                
+            # Bootstrap 일일 매수 집행
+            from core.database import get_trade_mode
+            is_mock = (get_trade_mode() == "MOCK")
+            
             order_amt = self.state.bootstrap_order_amount
-            qty_to_buy = int(order_amt / current_price)
-            if qty_to_buy <= 0 and order_amt > 0:
-                qty_to_buy = 1 # 최소 1주는 매수 시도
-                
-            limit_price = current_price
-            limit_price = self.broker.adjust_price_by_tick(symbol, limit_price, "BUY")
+            qty_to_buy = int(order_amt / current_price) if current_price > 0 else 0
             
-            # US는 LOC("30"), KR은 지정가("0") 사용
-            ptype = "30" if self.config.market == "US" else "0"
-            
-            logger.info(f"🚀 [Bootstrap Build-Up] {self.state.bootstrap_day_count + 1}/{self.state.bootstrap_days}일차 매수 집행")
-            logger.info(f"   -> 예정 금액: {order_amt:.2f}, 목표수량: {qty_to_buy}주, 단가: {limit_price}")
+            logger.info(f"🚀 [Bootstrap Build-Up] {self.state.bootstrap_day_count + 1}/{self.state.bootstrap_days}일차 매수 집행 (모의투자 여부: {is_mock})")
+            logger.info(f"   -> 예정 금액: {order_amt:.2f}, 목표수량: {qty_to_buy}주, 현재가: {current_price}")
             
             if qty_to_buy > 0:
+                if is_mock:
+                    # 모의투자 지정가 매수 모사 (+0.01$ 또는 +10원)
+                    tick_diff = 10 if self.config.market == "KR" else 0.01
+                    buy_price = current_price + tick_diff
+                    buy_price = self.broker.adjust_price_by_tick(symbol, buy_price, "BUY")
+                    ptype = "00"
+                else:
+                    buy_price = 0.0
+                    ptype = "01"
+
                 if preview:
                     planned_orders.append({
                         "strategy": "VR", "side": "BUY", "symbol": symbol,
-                        "qty": qty_to_buy, "price": limit_price, "type": ptype, "desc": f"VR_Bootstrap_{self.state.bootstrap_day_count + 1}th"
+                        "qty": qty_to_buy, "price": buy_price if is_mock else current_price, "type": ptype, "desc": f"VR_Bootstrap_{self.state.bootstrap_day_count + 1}th"
                     })
                 else:
                     try:
-                        self.broker.place_order(symbol, limit_price, qty_to_buy, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
+                        self.broker.place_order(symbol, buy_price, qty_to_buy, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                         time.sleep(0.2)
                     except Exception as err:
                         logger.error(f"[Bootstrap Build-Up] 매수 주문 실패: {err}")
             
             if not preview:
                 self.state.bootstrap_day_count += 1
-                self.state.last_E = shares * current_price
+                # 매수 후 대략적인 평가금 추적
+                self.state.last_E = (shares + qty_to_buy) * current_price
+                # Pool 차감 (대시보드 가용 Pool 갱신)
+                self.state.pool -= (qty_to_buy * current_price)
                 
                 # 빌드업 완료 시점에 RUNNING 모드로 자동 전환
                 if self.state.bootstrap_day_count >= self.state.bootstrap_days:
                     self.state.mode = 'RUNNING'
-                    self.state.V = self.state.pool + self.state.last_E
-                    self.state.cycle_V = self.state.V
+                    # 완료일 기준의 V값과 Pool을 동기화하여 실력공식 사이클 계산 시작
+                    E_end = (shares + qty_to_buy) * current_price
+                    G_coeff = self.config.G if self.config.G > 0 else 10.0
+                    new_V = (self.state.pool / G_coeff) + (E_end / (2.0 * math.sqrt(G_coeff)))
+                    
+                    self.state.V = new_V
+                    self.state.cycle_V = new_V
                     self.state.cycle_start_pool = self.state.pool
-                    logger.info(f"🎉 [Bootstrap Completed] {self.state.bootstrap_days}일의 초기 빌드업이 무사히 완료되었습니다! RUNNING 모드로 전환합니다. (목표 V: ${self.state.V:,.2f})")
-                    send_telegram_message(f"🎉 <b>[VR 빌드업 완료]</b> {symbol} 전략의 초기 빌드업({self.state.bootstrap_days}일)이 완료되어 RUNNING 모드로 자동 전환되었습니다!\n목표 V: ${self.state.V:,.2f}")
+                    logger.info(f"🎉 [Bootstrap Completed] {self.state.bootstrap_days}일의 초기 빌드업이 완료되었습니다! RUNNING 모드로 전환합니다. (목표 V: ${self.state.V:,.2f}, 잔여 Pool: ${self.state.pool:,.2f})")
+                    send_telegram_message(f"🎉 <b>[VR 빌드업 완료]</b> {symbol} 전략의 초기 빌드업({self.state.bootstrap_days}일)이 완료되어 RUNNING 모드로 자동 전환되었습니다!\n목표 V: ${self.state.V:,.2f}\n잔여 Pool: ${self.state.pool:,.2f}")
                 
-                save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
+                if self.config.use_db:
+                    save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
             
             return planned_orders if preview else None
 
@@ -1942,7 +2005,7 @@ class ValueRebalancingEngine:
                 
                 # KR 대응: 호가 단위 보정 및 지정가(00) 강제
                 limit_price = self.broker.adjust_price_by_tick(symbol, limit_price, "SELL")
-                ptype = "00"
+                ptype = "30" if self.config.market == "US" else "00"
 
                 if limit_price > 0:
                     if preview:
@@ -1962,6 +2025,10 @@ class ValueRebalancingEngine:
         if order_filter == "SELL_LIMIT_ONLY": return planned_orders if preview else None
 
         # --- 매수 주문 제출 ---
+        limit_ratio = (self.state.pool_limit_pct / 100.0) if hasattr(self.state, 'pool_limit_pct') else 0.5
+        max_use_pool = allocated_pool * limit_ratio
+        used_pool = 0.0
+
         for n in range(1, 6): # 5개 정도의 지정가 매수 주문 제출
             target_stock_val = low_band - allocated_pool
             if target_stock_val <= 0: break
@@ -1969,21 +2036,25 @@ class ValueRebalancingEngine:
 
             # KR 대응: 호가 단위 보정 및 지정가(00) 강제
             limit_price = self.broker.adjust_price_by_tick(symbol, limit_price, "BUY")
-            ptype = "00"
+            ptype = "30" if self.config.market == "US" else "00"
 
             if limit_price > 0:
+                if used_pool + limit_price > max_use_pool:
+                    logger.info(f"-> [VR 매수 한도 제한] 누적 매수 주문 예정액({used_pool + limit_price:.2f})이 최대 사용 한도({max_use_pool:.2f})를 초과하여 매수 {n}차 주문부터는 중단합니다.")
+                    break
+
                 if preview:
                     if not self._is_already_ordered("BUY", limit_price, 1, open_orders_pool):
                          planned_orders.append({
                                 "strategy": "VR", "side": "BUY", "symbol": symbol,
                                 "qty": 1, "price": limit_price, "type": ptype, "desc": f"VR_Buy_{n}th"
                             })
+                         used_pool += limit_price
                 else:
                     if not self._is_already_ordered("BUY", limit_price, 1, open_orders_pool):
                         self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                         time.sleep(0.2) # API rate limit
-                    else: # type: ignore
-                        logger.info(f"-> [VR 매수] {limit_price} 동일 주문 존재. 스킵.")
+                    used_pool += limit_price
         
         return planned_orders if preview else None
 
@@ -2019,21 +2090,32 @@ class ValueRebalancingEngine:
         # --- 모드별 로직 실행 ---
         if self.state.mode == 'BOOTSTRAP':
             logger.info("초기 매수(Bootstrap) 단계 진행 중...")
-            if self.state.bootstrap_day_count < 10:
-                buy_amount = (self.config.initial_budget * 0.75) / 10.0
-                if cash_on_account >= buy_amount and current_price > 0:
-                    qty = int(buy_amount / current_price)
-                    if qty > 0:
-                        self.broker.place_order(self.config.symbol, current_price, qty, "BUY", price_type="00", strategy="VR", strategy_name=self.config.strategy_name)
-                        logger.info(f"  -> 초기 매수 {self.state.bootstrap_day_count + 1}/10: {qty}주 매수")
-                self.state.bootstrap_day_count += 1
+            exec_price = current_price
+            order_amt = self.state.bootstrap_order_amount
+            qty_to_buy = int(order_amt / exec_price) if exec_price > 0 else 0
             
-            if self.state.bootstrap_day_count >= 10:
+            if qty_to_buy > 0:
+                success = self.broker.place_order(self.config.symbol, exec_price, qty_to_buy, "BUY", price_type="01", strategy="VR", strategy_name=self.config.strategy_name)
+                if success:
+                    logger.info(f"  -> 초기 시장가 매수 체결: {qty_to_buy}주 @ ${exec_price:.2f} (Bootstrap {self.state.bootstrap_day_count + 1}/{self.state.bootstrap_days}일차)")
+            
+            self.state.bootstrap_day_count += 1
+            self.state.last_E = (shares + qty_to_buy) * exec_price
+            self.state.pool = self.broker.get_cash_pool()
+            
+            if self.state.bootstrap_day_count >= self.state.bootstrap_days:
                 logger.info("초기 매수(Bootstrap) 완료. 일반 리밸런싱 모드로 전환합니다.")
                 self.state.mode = 'RUNNING'
-                # 첫 사이클 V값 계산을 위해 is_cycle_start_day를 True로 간주
-                self.run_cycle(date, contribution, is_cycle_start_day=True)
-                return # 재귀 호출 후 종료
+                E_end = (shares + qty_to_buy) * exec_price
+                G_coeff = self.config.G if self.config.G > 0 else 10.0
+                new_V = (self.state.pool / G_coeff) + (E_end / (2.0 * math.sqrt(G_coeff)))
+                
+                self.state.V = new_V
+                self.state.cycle_V = new_V
+                self.state.cycle_start_pool = self.state.pool
+                
+            self._save_state()
+            return
 
         elif self.state.mode == 'RUNNING':
             logger.info(f"리밸런싱 실행. 목표 V: ${self.state.cycle_V:,.2f}")
