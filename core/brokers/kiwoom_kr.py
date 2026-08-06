@@ -292,20 +292,22 @@ class KiwoomKrBroker(Broker):
                 return data
         return None
 
-    def get_account_equity(self, symbol: str) -> Tuple[float, float, float]:
+    def get_account_equity(self, symbol: str) -> Optional[Tuple[float, float, float]]:
         try:
             data = self._get_acnt_info()
             if not data:
-                return 0.0, 0.0, 0.0
+                return None
                 
             for item in data.get('stk_acnt_evlt_prst', []):
                 item_cd = item.get('stk_cd', '').strip()
                 # 접두사 A 등 제거 후 비교
                 if item_cd.endswith(symbol.strip()):
                     return float(item.get('rmnd_qty', 0)), float(item.get('avg_prc', 0)), float(item.get('evlt_amt', 0))
+            # 결과 리스트에 종목이 없으면 보유 수량 0
+            return 0.0, 0.0, 0.0
         except Exception as e:
             logger.error(f"[KR] 잔고 조회 중 오류 발생: {e}")
-        return 0.0, 0.0, 0.0
+            return None
 
     def get_cumulative_buy_amount(self, symbol: str) -> float:
         res = self.get_account_equity(symbol)
@@ -358,6 +360,19 @@ class KiwoomKrBroker(Broker):
         [국내주식] 주문 전송
         price_type (trde_tp): 지정가: "0", 시장가: "3" (키움증권 REST API 명세 기준)
         """
+        # 모의투자(MOCK) 모드이고 시장가 주문이 요청된 경우, 현재가 기준으로 지정가 호가 보정 우회 처리
+        if self.trade_mode == "MOCK" and price_type in ["01", "3"]:
+            current_price = self.get_price(symbol)
+            if current_price > 0:
+                tick_diff = 10 if order_type == "BUY" else -10
+                price = current_price + tick_diff
+                price = self.adjust_price_by_tick(symbol, price, order_type)
+                price_type = "00"
+                logger.info(f"🔄 [MOCK KR 시장가 우회] 시장가 주문을 지정가 {price:.0f}로 변환하여 제출합니다. ({symbol})")
+            else:
+                logger.error(f"❌ [MOCK KR 시장가 우회 실패] 현재가를 조회할 수 없어 주문을 진행하지 않습니다. ({symbol})")
+                return False
+
         action = "BUY" if order_type == "BUY" else "SELL"
         tr_id = "kt10000" if action == "BUY" else "kt10001"
         url = f"{self.base_url}/api/dostk/ordr"

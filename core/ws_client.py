@@ -567,9 +567,16 @@ class KisWebSocketClient:
             
             # FID 파싱
             odno = str(values.get('9203'))
-            exec_qty_str = values.get('911')
-            exec_price_str = values.get('910')
             status_text = values.get('913') # 접수, 체결, 취소 등
+            
+            # 체결 단계일 때는 체결량(911)을 사용하고, 접수 등 비체결 단계일 때는 주문수량(900)을 사용
+            cntg_div = "02" if "체결" in status_text else "01"
+            if cntg_div == "02":
+                exec_qty_str = values.get('911')
+            else:
+                exec_qty_str = values.get('900') or values.get('911')
+                
+            exec_price_str = values.get('910')
             side_raw = values.get('907') # 1:매도, 2:매수
             exec_time = values.get('908') # HHmmss
             order_div_cd = str(values.get('906') or "") # 매매구분명 또는 코드
@@ -579,10 +586,6 @@ class KisWebSocketClient:
                 
             exec_qty = int(float(exec_qty_str))
             exec_price = float(exec_price_str)
-            
-            # 주문 접수/체결 플래그 설정 (913 상태 기준)
-            # 체결 상태면 cntg_div = "02"
-            cntg_div = "02" if "체결" in status_text else "01"
             order_type = "SELL" if side_raw == "1" else "BUY"
 
             logger.debug(f"[WS] {self.market} Parsed Fields: odno={odno}, order_type={order_type}, symbol={symbol}, exec_qty={exec_qty}, exec_price={exec_price}, status={status_text}")

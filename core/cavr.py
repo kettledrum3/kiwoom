@@ -868,7 +868,8 @@ class CostAveragingEngine:
                 del state_data['cumulative_buy_amount'] # 더 이상 엔진에서 관리하지 않음
             return CAState(**state_data)
         
-        shares, avg_price, _ = self.broker.get_account_equity(self.config.symbol)
+        equity_res = self.broker.get_account_equity(self.config.symbol)
+        shares, avg_price, _ = equity_res if equity_res else (0.0, 0.0, 0.0)
         
         return CAState(
             symbol=self.config.symbol,
@@ -1762,7 +1763,8 @@ class ValueRebalancingEngine:
             return VRState(**state_data)
 
         # 초기 상태 (백업이 유실되었거나 엔진이 수동으로 구동 시의 초기화)
-        shares, avg_price, eval_amt = self.broker.get_account_equity(self.config.symbol)
+        equity_res = self.broker.get_account_equity(self.config.symbol)
+        shares, avg_price, eval_amt = equity_res if equity_res else (0.0, 0.0, 0.0)
         cash_pool = self.broker.get_cash_pool()
         
         # 1. 운용자본금이 주어져 있다면 그것이 Pool이 됨
@@ -1875,7 +1877,11 @@ class ValueRebalancingEngine:
                 logger.info(f"[{symbol}] VR 미체결 주문 {len(open_orders_pool)}건 감지. 중복 주문은 제외합니다.")
 
         # 1. 최신 잔고 및 시세 정보 조회
-        shares, _, eval_amt = self.broker.get_account_equity(self.config.symbol)
+        equity_res = self.broker.get_account_equity(self.config.symbol)
+        if equity_res is None:
+            logger.warning(f"[{symbol}] 잔고 정보 조회 실패. 이번 사이클 주문 로직을 건너뜁니다.")
+            return [] if preview else None
+        shares, _, eval_amt = equity_res
         
         # [공식 수정] 공식문서(strategy_formula.md 105라인) 기준 E는 주식 평가액 단독입니다 (예수금 미합산).
         allocated_pool = self.state.pool
@@ -2070,7 +2076,12 @@ class ValueRebalancingEngine:
             return
         day_high = self.broker.get_current_high(symbol=self.config.symbol)
         day_low = self.broker.get_current_low(symbol=self.config.symbol)
-        shares, _, eval_amt = self.broker.get_account_equity(self.config.symbol)
+        equity_res = self.broker.get_account_equity(self.config.symbol)
+        if equity_res is None:
+            logger.warning(f"[{self.config.symbol}] 잔고 정보 조회 실패. 이번 VR 사이클 매수/매도 로직을 건너뜁니다.")
+            self._save_state()
+            return
+        shares, _, eval_amt = equity_res
         cash_on_account = self.broker.get_cash_pool()
         E = eval_amt + cash_on_account
 
@@ -2152,7 +2163,8 @@ class ValueRebalancingEngine:
 
             # --- 매수 로직 (지정가 예약 매수) ---
             # 매도 후 현금이 늘어났을 수 있으므로 잔고 재확인 (VR은 보통 아침에 일괄 주문이지만, 백테스트는 순차 처리)
-            current_shares_after_sell, _, _ = self.broker.get_account_equity(self.config.symbol)
+            equity_res = self.broker.get_account_equity(self.config.symbol)
+            current_shares_after_sell = equity_res[0] if equity_res else current_shares_after_sell
             
             # 최대 100단계의 매수 주문을 시뮬레이션 (무한 루프 방지)
             for n in range(1, 101):

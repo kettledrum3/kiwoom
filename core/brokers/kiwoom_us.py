@@ -250,6 +250,25 @@ class KiwoomUsBroker(Broker):
             cache_date, cache_data = self._exchange_rate_cache
             if cache_date == today_str:
                 return cache_data
+
+        # 0-1. DB 캐시 확인 (강제 조회가 아니고, 오늘 날짜로 DB에 저장된 환율이 존재하면 그것을 우선 사용)
+        if not force:
+            db_rate_str = get_config("USDKRW", "")
+            db_rate_date = get_config("USDKRW_UPDATE_DATE", "")
+            if db_rate_date == today_str and db_rate_str:
+                try:
+                    db_rate = float(db_rate_str)
+                    if db_rate > 0:
+                        logger.info(f"💵 [ExchangeRate] DB에 저장된 오늘 자 환율을 사용합니다: 1달러당 {db_rate:.2f}원")
+                        res_dict = {
+                            "rate": db_rate,
+                            "diff": 0.0,
+                            "pct": 0.0
+                        }
+                        self._exchange_rate_cache = (today_str, res_dict)
+                        return res_dict
+                except ValueError:
+                    pass
         
         ex_key = os.getenv("EXCHANGERATE_KEY", "").strip()
         use_external_api = False
@@ -321,9 +340,15 @@ class KiwoomUsBroker(Broker):
                             }
                             self._exchange_rate_cache = (today_str, res_dict)
                             return res_dict
+                        else:
+                            logger.warning("⚠️ [ExchangeRate] Exchangerate.host API 응답에서 USDKRW 환율 값을 찾을 수 없거나 0 이하입니다.")
                     else:
                         logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API success 필드가 False입니다. Error Info: {res_data.get('error')}")
-                logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host 응답이 올바르지 않습니다. (Status: {response.status_code})")
+                else:
+                    err_msg = f"Status: {response.status_code}"
+                    if response.status_code == 429:
+                        err_msg += " (Too Many Requests - API rate limit exceeded)"
+                    logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host 응답이 올바르지 않습니다. ({err_msg}, Body: {response.text[:200]})")
             except Exception as e:
                 logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API 호출 중 오류 발생: {e}. 키움 API로 대체하여 조회합니다.")
 
@@ -355,7 +380,7 @@ class KiwoomUsBroker(Broker):
         rate_info = self.get_exchange_rate()
         return [{"date": datetime.now().strftime("%Y%m%d"), "rate": rate_info["rate"]}]
 
-    def get_account_equity(self, symbol: str) -> Tuple[float, float, float]:
+    def get_account_equity(self, symbol: str) -> Optional[Tuple[float, float, float]]:
         """ust21070 (미국주식 원장잔고확인) API 연동"""
         url = f"{self.base_url}/api/us/acnt"
         body = {
@@ -366,7 +391,7 @@ class KiwoomUsBroker(Broker):
             res = self._call_api("POST", url, "ust21070", data=json.dumps(body))
             if not res:
                 logger.error("[US] 잔고 조회 API 응답 없음")
-                return 0.0, 0.0, 0.0
+                return None
             data = res.json()
             if data.get('return_code') == 0:
                 res_list = data.get('result_list', [])
@@ -376,14 +401,20 @@ class KiwoomUsBroker(Broker):
                         poss_qty_val = int(float(item.get('poss_qty', 0)))
                         # logger.info(f"   -> {symbol} 발견: 수량 {poss_qty_val}주, 평단가 {item.get('frgn_stk_book_uv')}$, 평가금액 {item.get('evlt_amt')}$")
                         return float(item.get('poss_qty', 0)), float(item.get('frgn_stk_book_uv', 0)), float(item.get('evlt_amt', 0))
+                # 결과 리스트에 종목이 없으면 보유 수량 0
+                return 0.0, 0.0, 0.0
             else:
                 logger.warning(f"🔍 [US API Debug] ust21070 응답 실패: {data.get('return_msg')}")
+                return None
         except Exception as e:
             logger.error(f"[US] 잔고 조회 중 오류 발생: {e}")
-        return 0.0, 0.0, 0.0
+            return None
 
     def get_cumulative_buy_amount(self, symbol: str) -> float:
-        shares, avg_price, _ = self.get_account_equity(symbol)
+        res = self.get_account_equity(symbol)
+        if res is None:
+            return 0.0
+        shares, avg_price, _ = res
         return shares * avg_price
 
     def get_cash_pool(self) -> float:
@@ -406,6 +437,19 @@ class KiwoomUsBroker(Broker):
         [미국주식] 주문 전송
         price_type (frgn_trde_tp): 지정가: "00", 시장가: "03", LOC: "30" (키움증권 REST API 명세 기준)
         """
+        # 모의투자(MOCK) 모드이고 시장가 주문이 요청된 경우, 현재가 기준으로 지정가 호가 보정 우회 처리
+        if self.trade_mode == "MOCK" and price_type in ["01", "3", "03"]:
+            current_price = self.get_price(symbol)
+            if current_price > 0:
+                tick_diff = 0.01 if order_type == "BUY" else -0.01
+                price = current_price + tick_diff
+                price = self.adjust_price_by_tick(symbol, price, order_type)
+                price_type = "00"
+                logger.info(f"🔄 [MOCK US 시장가 우회] 시장가 주문을 지정가 {price:.2f}로 변환하여 제출합니다. ({symbol})")
+            else:
+                logger.error(f"❌ [MOCK US 시장가 우회 실패] 현재가를 조회할 수 없어 주문을 진행하지 않습니다. ({symbol})")
+                return False
+
         action = "BUY" if order_type == "BUY" else "SELL"
         tr_id = "ust20000" if action == "BUY" else "ust20001"
         url = f"{self.base_url}/api/us/ordr"

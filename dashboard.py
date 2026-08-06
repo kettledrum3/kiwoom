@@ -962,7 +962,8 @@ with st.sidebar:
             elif strategy_choice == "VR":
                 # 기존 잔고를 편입하거나 미편입하는 로직 적용
                 broker = ActiveBroker
-                shares, avg_price, eval_amt = broker.get_account_equity(symbol)
+                equity_res = broker.get_account_equity(symbol)
+                shares, avg_price, eval_amt = equity_res if equity_res else (0.0, 0.0, 0.0)
                 
                 if vr_include_existing:
                     initial_shares = shares
@@ -1183,7 +1184,10 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
     if 'live_account' not in st.session_state or st.session_state['live_account'].get('symbol') != symbol or (now_ts - st.session_state.get(last_auto_sync_key, 0) > sync_interval):
         try:
             logger.info(f"🔄 [Auto-Sync] {symbol} {market_code} 실시간 잔고 자동 연동 및 동기화 실행")
-            shares, avg_price, eval_amt = ActiveBroker.get_account_equity(symbol)
+            equity_res = ActiveBroker.get_account_equity(symbol)
+            if equity_res is None:
+                raise ValueError("잔고 조회 실패 (None 반환)")
+            shares, avg_price, eval_amt = equity_res
             pool = ActiveBroker.get_cash_pool()
             current_price = ActiveBroker.get_price(symbol)
             prev_close = ActiveBroker.get_previous_close(symbol)
@@ -1923,7 +1927,11 @@ if mode == "실전 투자":
                 
                 # 정보 조회
                 pool = broker.get_cash_pool()
-                shares, avg_price, eval_amt = broker.get_account_equity(symbol)
+                equity_res = broker.get_account_equity(symbol)
+                if equity_res is None:
+                    st.error("잔고 조회 실패 (API 응답 에러)")
+                    st.stop()
+                shares, avg_price, eval_amt = equity_res
                 current_price = broker.get_price(symbol)
                 prev_close = broker.get_previous_close(symbol)
                 
@@ -1998,7 +2006,11 @@ if mode == "실전 투자":
                 
                 # 강제동기화 완료 후에도 세션을 새로고침한다.
                 pool = broker.get_cash_pool()
-                shares, avg_price, eval_amt = broker.get_account_equity(symbol)
+                equity_res = broker.get_account_equity(symbol)
+                if equity_res is None:
+                    st.error("잔고 조회 실패 (API 응답 에러)")
+                    st.stop()
+                shares, avg_price, eval_amt = equity_res
                 current_price = broker.get_price(symbol)
                 prev_close = broker.get_previous_close(symbol)
                 
