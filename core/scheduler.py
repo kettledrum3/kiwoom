@@ -408,7 +408,10 @@ def job_market_open(market: str = "US"):
         if market == "KR":
             run_ca_strategies(market=market, check_existing=True, order_filter="SELL_LIMIT_ONLY", broker=broker)
         else:
-            run_ca_strategies(market=market, check_existing=True, broker=broker)
+            if broker.trade_mode == "MOCK":
+                run_ca_strategies(market=market, check_existing=True, order_filter="LIMIT_ONLY", broker=broker)
+            else:
+                run_ca_strategies(market=market, check_existing=True, broker=broker)
             
         run_vr_strategies(market=market, check_existing=True, broker=broker)
         
@@ -596,6 +599,32 @@ def job_kr_loc_simulation():
         run_ca_strategies(market=market, check_existing=False, order_filter="LOC_ONLY")
     except Exception as e:
         logger.error(f"[{market}] Job Market Open Failed: {e}", exc_info=True)
+
+def job_us_loc_simulation():
+    """미국 시장 장 종료 20분 전(15:40 ET) 모의계좌 전용 LOC 모사 주문 실행"""
+    market = "US"
+    trade_mode = get_trade_mode()
+    if trade_mode != "MOCK":
+        logger.info(f"⏭️ [LOC-Simulation-{market}] 실전 계좌 모드이므로 장마감 전 LOC 모사 주문을 건너뜁니다.")
+        return
+
+    if get_config("scheduler_status") != "running":
+        return
+
+    # 휴장일 체크
+    if get_config("us_market_opnd_yn") == "N":
+        logger.info(f"⏭️ [LOC-Simulation-{market}] 오늘은 미국 휴장일이므로 시뮬레이션을 건너뜁니다.")
+        return
+
+    logger.info(f"🔔 [{market}] 장 종료 20분 전 LOC 모사 주문을 시작합니다. (15:40 ET)")
+    send_telegram_message(f"🔔 <b>[{market} LOC 모사 주문]</b> 15:40 ET (모의투자 전용) 주문 제출을 시작합니다.")
+    
+    try:
+        # 15:40에는 LOC 주문(LOC 매수, LOC Star% 매수, LOC 매도)만 제출
+        # kiwoom_us.py의 place_order에서 모의계좌일 때 이 LOC 주문들은 일반 지정가(00)로 자동 변환되어 제출됩니다.
+        run_ca_strategies(market=market, check_existing=False, order_filter="LOC_ONLY")
+    except Exception as e:
+        logger.error(f"[{market}] Job Failed: {e}", exc_info=True)
 
 def job_check_shutdown():
     """DB의 종료 플래그를 확인하여 프로세스 종료"""
@@ -828,6 +857,13 @@ def main():
         trigger=CronTrigger(hour=15, minute=10, day_of_week='mon-fri', timezone=kr_tz),
         id='kr_loc_simulation',
         name='한국장 종료 전 LOC 모사 주문'
+    )
+
+    scheduler.add_job(
+        job_us_loc_simulation,
+        trigger=CronTrigger(hour=15, minute=40, day_of_week='mon-fri', timezone=ny_tz),
+        id='us_loc_simulation',
+        name='미국장 종료 전 LOC 모사 주문'
     )
     
     # [ADD] 미국 시장 프리마켓 시작 시 지정가 매도 주문

@@ -169,12 +169,36 @@ import json
 
 # KIS 주문 유형 코드 매핑 (cavr.py와 동일하게 유지)
 ORDER_TYPE_MAP = {
+    # 미국주식 (ust20000/ust20001)
     "00": "지정가",
-    "01": "시장가",
-    "31": "최유리 지정가", # LOO (Limit On Open)
-    "32": "최유리 시장가", # MOO (Market On Open)
-    "33": "MOC",          # Market On Close
-    "34": "LOC",          # Limit On Close
+    "03": "시장가",
+    "26": "VWAP지정가",
+    "27": "TWAP지정가",
+    "30": "LOC / 중간가(IOC)",
+    "33": "MOC",
+    "36": "VWAP시장가",
+    "37": "TWAP시장가",
+    "35": "STOP",
+    "34": "STOP LIMIT",
+
+    # 국내주식 (kt10000/kt10001)
+    "0": "보통",
+    "3": "시장가",
+    "5": "조건부지정가",
+    "81": "장마감후시간외",
+    "61": "장시작전시간외",
+    "62": "시간외단일가",
+    "6": "최유리지정가",
+    "7": "최우선지정가",
+    "10": "보통(IOC)",
+    "13": "시장가(IOC)",
+    "16": "최유리(IOC)",
+    "20": "보통(FOK)",
+    "23": "시장가(FOK)",
+    "26": "최유리(FOK)",
+    "28": "스톱지정가",
+    "29": "중간가",
+    "31": "중간가(FOK)",
 }
 
 st.session_state.auth_trace.append(f"Auth Check: auth={st.session_state.authenticated}, temp={st.session_state.temp_pass_mode}")

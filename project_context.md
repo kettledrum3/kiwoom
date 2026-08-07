@@ -467,3 +467,18 @@
     - `KiwoomUsBroker` 와 `KiwoomKrBroker` 의 `get_account_equity` 메서드에서 API 통신 예외, 무응답 또는 응답 코드 실패 시 기존의 `(0.0, 0.0, 0.0)` 을 반환하여 잔고가 0주인 실제 전량 매도 상태와 구분이 불가능했던 문제를 **`None` 을 반환**하도록 수정하여 API 장애 상황임을 구분함.
     - 전략 엔진(`cavr.py`) 및 대시보드(`dashboard.py`) 내의 모든 `get_account_equity` 호출부 9개 위치에 대해 `None` 반환 시의 예외 언팩 에러(`TypeError`) 방어 코드를 일제히 적용함.
     - `CostAveragingEngine` 은 잔고 조회 결과가 `None` 일 때 예외 없이 조용히 이번 사이클 루프를 건너뛰며, 이로써 통신 장애 시 계좌 잔고를 0주로 오해해 `SOXL_1차` 등 실행 중인 전략 차수가 강제로 자동 전환되는 오작동을 원천 차단함.
+
+### 📅 2026-08-07 ~ 08-08 (API 매매유형 전체 정의 확장, 조건부 감시가 지원, 미국주식 모의계좌 LOC 모사 15:40 배치 신설 및 유지보수 이력 삭제 범위 확대)
+*   **API 매매유형 전체 규격화 및 `stop_price` 파라미터 연동**:
+    - `core/brokers/base.py`, `core/backtest.py`, `core/brokers/kiwoom_us.py`, `core/brokers/kiwoom_kr.py`의 `place_order` 인터페이스에 조건부 주문 감시가를 지원하기 위한 `stop_price: Optional[float] = None` 파라미터를 통합 추가함.
+    - `API_SPEC.md` 규격에 근거하여 미국주식 매매유형 10종(`trde_tp` 00, 03, 26, 27, 30, 33, 36, 37, 35, 34)과 국내주식 매매유형 18종(`trde_tp` 0, 3, 5, 81, 61, 62, 6, 7, 10, 13, 16, 20, 23, 26, 28, 29, 30, 31)을 브로커 단에서 완벽 분기 처리함.
+    - 미국주식 매도 시 `stop_pric` 필드를, 국내주식 스톱지정가(`28`) 시 `cond_uv` 필드를 전달받은 감시가격(`stop_price`)에 따라 동적으로 구성해 전송되도록 보강함.
+    - `cavr.py`, `dashboard.py`, `ws_client.py`의 `ORDER_TYPE_MAP`을 전체 일원화 확장하고, 중복 코드인 `"30"`은 `"LOC / 중간가(IOC)"`로 매핑 명시함.
+*   **미국주식 모의계좌(MOCK)용 LOC 모사 시스템 및 15:40 예약배치 신설**:
+    - 모의투자 계좌에서 미국주식 LOC 주문을 수신하지 못하는 제약을 해소하기 위해 국내주식용 'LOC 모사' 흐름을 적용함.
+    - 모의투자 모드 장초반(09:35 ET) 가동 시에는 `order_filter="LIMIT_ONLY"` 필터를 주어 LOC 주문의 전송을 철저히 배제하고, 장 마감 20분 전인 **15:40 ET**에 전용 자동 배치인 `job_us_loc_simulation()`를 호출하여 `order_filter="LOC_ONLY"`로 분할 전송하도록 스케줄러를 개편함.
+    - 모의투자 모드에서 LOC 주문(`trde_tp="30"`)을 접수하면, `kiwoom_us.py` 내 `place_order`에서 자동으로 지정가(`"00"`)로 변환(우회)하여 서버에 전송하도록 구현함으로써, 장마감 20분 전 실시간 가격으로 지정가 체결이 이루어지게 시뮬레이션함.
+*   **Optional Type import 누락 결함 조치**:
+    - `base.py` 및 `backtest.py` 리팩토링 과정에서 `Optional` 어노테이션 사용 시 발생했던 `NameError: name 'Optional' is not defined` 오류를 수정하기 위해 `typing` 모듈에서 `Optional`을 명시적으로 임포트하여 안정성을 보장함.
+*   **유지보수 이력(order_history)의 클린업 필터 범위 고도화**:
+    - 기존에 `CANCELED` 상태의 주문에만 적용되던 3일 경과 클린업을 개선하여, 통신 유실 등으로 `ORDERED` 나 `FAILED` 상태로 유실된 채 장기 누적되는 데이터 찌꺼기까지 상태에 무관하게 `timestamp` 기준 3일이 경과하면 일체 자동 청소하도록 `cleanup_old_canceled_orders_db` 쿼리를 정교화함.

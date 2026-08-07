@@ -355,19 +355,19 @@ class KiwoomKrBroker(Broker):
         else:
             return math.floor(price / tick) * tick
 
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "0", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         """
         [국내주식] 주문 전송
-        price_type (trde_tp): 지정가: "0", 시장가: "3" (키움증권 REST API 명세 기준)
+        매매구분(trde_tp): 0:보통, 3:시장가, 5:조건부지정가, 81:장마감후시간외, 61:장시작전시간외, 62:시간외단일가, 6:최유리지정가, 7:최우선지정가, 10:보통(IOC), 13:시장가(IOC), 16:최유리(IOC), 20:보통(FOK), 23:시장가(FOK), 26:최유리(FOK), 28:스톱지정가, 29:중간가, 30:중간가(IOC), 31:중간가(FOK)
         """
         # 모의투자(MOCK) 모드이고 시장가 주문이 요청된 경우, 현재가 기준으로 지정가 호가 보정 우회 처리
-        if self.trade_mode == "MOCK" and price_type in ["01", "3"]:
+        if self.trade_mode == "MOCK" and price_type in ["3", "13", "23"]:
             current_price = self.get_price(symbol)
             if current_price > 0:
                 tick_diff = 10 if order_type == "BUY" else -10
                 price = current_price + tick_diff
                 price = self.adjust_price_by_tick(symbol, price, order_type)
-                price_type = "00"
+                price_type = "0"
                 logger.info(f"🔄 [MOCK KR 시장가 우회] 시장가 주문을 지정가 {price:.0f}로 변환하여 제출합니다. ({symbol})")
             else:
                 logger.error(f"❌ [MOCK KR 시장가 우회 실패] 현재가를 조회할 수 없어 주문을 진행하지 않습니다. ({symbol})")
@@ -377,16 +377,18 @@ class KiwoomKrBroker(Broker):
         tr_id = "kt10000" if action == "BUY" else "kt10001"
         url = f"{self.base_url}/api/dostk/ordr"
 
-        # KIS의 "00" 지정가, "01" 시장가를 키움 규격인 "0", "3"으로 보정
-        if price_type in ["00", "0"]:
-            trde_tp = "0"
-            ord_uv = str(int(price))
-        elif price_type in ["01", "3"]:
-            trde_tp = "3"
-            ord_uv = "0" # 시장가는 가격 0으로 제출
+        trde_tp = price_type
+        # 시장가/IOC시장가/FOK시장가 유형은 단가를 "0"으로 입력
+        if trde_tp in ["3", "13", "23"]:
+            ord_uv = "0"
         else:
-            trde_tp = "0" # 기본 지정가
             ord_uv = str(int(price))
+
+        cond_uv = ""
+        if stop_price is not None:
+            cond_uv = str(int(stop_price))
+        elif trde_tp == "28":
+            cond_uv = str(int(price))
 
         body = {
             "dmst_stex_tp": "KRX",
@@ -394,7 +396,7 @@ class KiwoomKrBroker(Broker):
             "ord_qty": str(int(qty)),
             "ord_uv": ord_uv,
             "trde_tp": trde_tp,
-            "cond_uv": ""
+            "cond_uv": cond_uv
         }
 
         try:

@@ -35,22 +35,38 @@ _last_token_invalidated_time = {} # market -> last time token was invalidated
 
 from core.notifier import send_telegram_message # MOVED: 순환 참조 방지를 위해 아래로 이동
 
-# KIS 주문 유형 코드 매핑
+# Kiwoom 주문 유형 매핑
 ORDER_TYPE_MAP = {
+    # 미국주식 (ust20000/ust20001)
     "00": "지정가",
-    "01": "시장가",
-    "02": "조건부지정가",
-    "03": "최유리지정가",
-    "04": "최우선지정가",
-    "05": "장전 시간외",
-    "06": "장후 시간외",
-    "07": "시간외 단일가",
-    "31": "MOO (장개시시장가)",
-    "32": "LOO (장개시지정가)",
-    "33": "MOC (장마감시장가)",
-    "34": "LOC (장마감지정가)",
-    "35": "TWAP (시간가중평균)",
-    "36": "VWAP (거래량가중평균)",
+    "03": "시장가",
+    "26": "VWAP지정가",
+    "27": "TWAP지정가",
+    "30": "LOC / 중간가(IOC)",
+    "33": "MOC",
+    "36": "VWAP시장가",
+    "37": "TWAP시장가",
+    "35": "STOP",
+    "34": "STOP LIMIT",
+
+    # 국내주식 (kt10000/kt10001)
+    "0": "보통",
+    "3": "시장가",
+    "5": "조건부지정가",
+    "81": "장마감후시간외",
+    "61": "장시작전시간외",
+    "62": "시간외단일가",
+    "6": "최유리지정가",
+    "7": "최우선지정가",
+    "10": "보통(IOC)",
+    "13": "시장가(IOC)",
+    "16": "최유리(IOC)",
+    "20": "보통(FOK)",
+    "23": "시장가(FOK)",
+    "26": "최유리(FOK)",
+    "28": "스톱지정가",
+    "29": "중간가",
+    "31": "중간가(FOK)",
 }
 
 def invalidate_access_token_controlled(market: str, account_no: str, trade_mode: str = None):
@@ -910,12 +926,18 @@ class CostAveragingEngine:
 
     def _buy(self, amount_to_invest: float, price: float, desc: str, turn: float = None, price_type: str = "00", preview: bool = False) -> bool:
         """매수 실행 및 상태 업데이트"""
-        # [KR Market Split Logic]
+        # [KR / MOCK US Market Split Logic]
+        is_split_market = self.config.market == "KR" or (self.config.market == "US" and self.broker.trade_mode == "MOCK")
         if self.config.market == "KR" and self.current_order_filter == "SELL_LIMIT_ONLY":
             return False # 오전장: 매수 금지
-            
-        if self.config.market == "KR" and self.current_order_filter == "LOC_ONLY":
-            is_loc_type = "LOC" in desc or "Star%" in desc or price_type == "34"
+
+        if is_split_market and self.current_order_filter == "LIMIT_ONLY":
+            is_loc_type = "LOC" in desc or "Star%" in desc or price_type == "30"
+            if is_loc_type:
+                return False
+
+        if is_split_market and self.current_order_filter == "LOC_ONLY":
+            is_loc_type = "LOC" in desc or "Star%" in desc or price_type == "30"
             if not is_loc_type:
                 return False
 
@@ -924,9 +946,9 @@ class CostAveragingEngine:
             logger.info(f"⚠️ [매수 스킵] {self.config.symbol}: 잔고부족(보유:{self.broker.get_cash_pool():.2f} < 필요:{amount_to_invest:.2f}) 또는 가격오류({price})")
             return False
 
-        # [Multi-Market] KR 시장은 LOC/MOC 미지원 -> 지정가(00) 강제
-        if self.config.market == "KR" and price_type in ["34", "33", "32", "31"]:
-            price_type = "00"
+        # [Multi-Market] KR 시장은 LOC 미지원 -> 지정가(0) 강제
+        if self.config.market == "KR" and price_type == "30":
+            price_type = "0"
 
         # 가격 호가 단위 보정
         price = self._round_price(price, "BUY")
@@ -985,9 +1007,10 @@ class CostAveragingEngine:
 
     def _sell(self, qty_to_sell: float, price: float, desc: str, price_type: str = "00", preview: bool = False) -> float:
         """매도 실행 및 손익 계산"""
-        # [KR Market Split Logic]
-        if self.config.market == "KR" and self.current_order_filter:
-            is_loc_type = "LOC" in desc or "Star%" in desc
+        # [KR / MOCK US Market Split Logic]
+        is_split_market = self.config.market == "KR" or (self.config.market == "US" and self.broker.trade_mode == "MOCK")
+        if is_split_market and self.current_order_filter:
+            is_loc_type = "LOC" in desc or "Star%" in desc or price_type == "30"
             if self.current_order_filter == "LIMIT_ONLY" and is_loc_type:
                 return False
             if self.current_order_filter == "LOC_ONLY" and not is_loc_type:
@@ -999,9 +1022,9 @@ class CostAveragingEngine:
         
         real_qty = min(qty_to_sell, self.state.total_shares)
         
-        # [Multi-Market] KR 시장은 LOC/MOC 미지원 -> 지정가(00) 강제
-        if self.config.market == "KR" and price_type in ["34", "33", "32", "31"]:
-            price_type = "00"
+        # [Multi-Market] KR 시장은 LOC 미지원 -> 지정가(0) 강제
+        if self.config.market == "KR" and price_type == "30":
+            price_type = "0"
 
         # 가격 호가 단위 보정
         price = self._round_price(price, "SELL")
@@ -1185,8 +1208,9 @@ class CostAveragingEngine:
                 drop_threshold = getattr(self.config, 'intraday_drop_threshold', 0.05)
                 desc_msg = f"(장중) -{drop_threshold*100:.0f}% 급락 시장가 매수"
 
-                # 시장가(01)로 0.5T 분량 매수 시도
-                if self._buy(buy_amount, latest_price, desc_msg, price_type="01"):
+                # 시장가로 0.5T 분량 매수 시도 (US: 03, KR: 3)
+                ptype = "03" if self.config.market == "US" else "3"
+                if self._buy(buy_amount, latest_price, desc_msg, price_type=ptype):
                     symbol_display = format_symbol_display(self.config.symbol, self.config.market)
                     cur_sym = "₩" if self.config.market == "KR" else "$"
                     def fmt(v):
@@ -1461,9 +1485,12 @@ class CostAveragingEngine:
         sell_qty = math.floor(total_qty / sell_unit_divisor)
 
         if sell_qty > 0:
-            # 첫날은 MOC, 이후는 별지점 LOC
+            # 첫날은 MOC(시장가), 이후는 별지점 LOC
             is_first_day = self.state.current_turn > (self.config.a_default - 0.1) # 소진 직후
-            p_type = "33" if is_first_day else "34"
+            if self.config.market == "US":
+                p_type = "03" if is_first_day else "30"
+            else:
+                p_type = "3" if is_first_day else "0"
             desc = "리버스 처음매도(MOC)" if is_first_day else "리버스 무한매도(LOC)"
             
             profit = self._sell(sell_qty, self.state.reverse_star_price, desc, price_type=p_type, preview=preview)
@@ -1477,7 +1504,8 @@ class CostAveragingEngine:
             buy_budget = self.state.pool / 4
             buy_price = self.state.reverse_star_price * 0.9999 # 별지점 아래
             
-            if self._buy(buy_budget, buy_price, "리버스 쿼터매수(LOC)", price_type="34", preview=preview):
+            ptype = "30" if self.config.market == "US" else "0"
+            if self._buy(buy_budget, buy_price, "리버스 쿼터매수(LOC)", price_type=ptype, preview=preview):
                 if not preview:
                     # T값 업데이트: T + (a-T)*0.25
                     self.state.current_turn += (self.config.a_default - self.state.current_turn) * 0.25
@@ -1502,7 +1530,9 @@ class CostAveragingEngine:
                 logger.info(f"쿼터손절 진입 조건 만족 (T={self.state.current_turn}, 손실={current_loss_pct*100:.1f}%)")
                 qty_to_sell = int(self.state.total_shares * 0.25)
                 if qty_to_sell > 0:
-                    profit = self._sell(qty_to_sell, current_price, "쿼터 손절 진입 매도", price_type="33", preview=preview) # MOC 매도
+                    # 모의/실전 시장가로 전송 (US: 03, KR: 3)
+                    ptype = "03" if self.config.market == "US" else "3"
+                    profit = self._sell(qty_to_sell, current_price, "쿼터 손절 진입 매도", price_type=ptype, preview=preview)
                     cycle_profit += profit
                 
                 if not preview:
@@ -1522,7 +1552,9 @@ class CostAveragingEngine:
                 logger.info("쿼터 모드 10회 종료 후 여전히 손실. 재진입(리셋)합니다.")
                 qty_to_sell = int(self.state.total_shares * 0.25)
                 if qty_to_sell > 0:
-                    profit = self._sell(qty_to_sell, current_price, "쿼터 손절 재진입 매도", price_type="33", preview=preview) # MOC 매도
+                    # 모의/실전 시장가로 전송 (US: 03, KR: 3)
+                    ptype = "03" if self.config.market == "US" else "3"
+                    profit = self._sell(qty_to_sell, current_price, "쿼터 손절 재진입 매도", price_type=ptype, preview=preview)
                     cycle_profit += profit
                 if not preview: self.state.quarter_turn = 0
                 return False
@@ -1544,7 +1576,9 @@ class CostAveragingEngine:
             remaining_shares = max(0, self.state.total_shares - qty_75)
 
             if remaining_shares > 0:
-                profit = self._sell(remaining_shares, stop_price, "(쿼터) -10% LOC 매도", price_type="34", preview=preview) # LOC 매도
+                # LOC 매도 (US: 30, KR: 0)
+                ptype = "30" if self.config.market == "US" else "0"
+                profit = self._sell(remaining_shares, stop_price, "(쿼터) -10% LOC 매도", price_type=ptype, preview=preview)
                 cycle_profit += profit
                 
         else: # NORMAL 모드
@@ -1578,7 +1612,9 @@ class CostAveragingEngine:
             exec_qty_25 = min(current_shares, qty_25) if not preview else qty_25
 
             if exec_qty_25 > 0:
-                profit = self._sell(exec_qty_25, loc_sell_price, "(V2.2) Star% LOC 매도", price_type="34", preview=preview) # price_type 34는 KR 시장에서 00으로 자동 변환됨
+                # LOC 매도 (US: 30, KR: 0)
+                ptype = "30" if self.config.market == "US" else "0"
+                profit = self._sell(exec_qty_25, loc_sell_price, "(V2.2) Star% LOC 매도", price_type=ptype, preview=preview)
                 cycle_profit += profit
 
         # (3) 사이클 종료 체크
@@ -1609,6 +1645,9 @@ class CostAveragingEngine:
         star = self.state.day_start_star_pct if (use_snapshot and self.state.day_start_star_pct != 0) else self._calculate_star_percent(self.state.current_turn)
         turn_to_log = self.state.day_start_turn if (use_snapshot and self.state.day_start_turn > 0) else self.state.current_turn
 
+        # LOC 매매 유형 설정 (US: 30, KR: 0)
+        ptype = "30" if self.config.market == "US" else "0"
+
         # 1. 쿼터 손절 모드 매수
         if self.state.mode == "QUARTER":
             if self.state.quarter_turn < 10:
@@ -1617,7 +1656,7 @@ class CostAveragingEngine:
                 # LOC 매수: min(평단*0.9, 현재가*1.15)
                 limit_price = min(base_price * 0.9, current_price * 1.15)
                 if current_price <= limit_price:
-                    self._buy(buy_amount, limit_price, "쿼터 손절 매수", price_type="34", preview=preview) # LOC
+                    self._buy(buy_amount, limit_price, "쿼터 손절 매수", price_type=ptype, preview=preview) # LOC
                     if not preview:
                         self.state.quarter_turn += 1
             return
@@ -1631,17 +1670,17 @@ class CostAveragingEngine:
             
             # 평단 LOC: min(평단, 현재가*1.15)
             limit_price_1 = min(base_price, current_price * 1.15)
-            self._buy(half_amount, limit_price_1, f"(전반전) 평단가 매수 ({ORDER_TYPE_MAP['34']})", turn=turn_to_log, price_type="34", preview=preview) # LOC
+            self._buy(half_amount, limit_price_1, f"(전반전) 평단가 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
 
             # 큰수 LOC: min(평단*(1+Star%), 현재가*1.15)
             limit_price_2 = min((base_price * (1.0 + star)) + loc_buy_offset, current_price * 1.15)
-            self._buy(half_amount, limit_price_2, f"(전반전) 큰수LOC 매수 ({ORDER_TYPE_MAP['34']})", turn=turn_to_log, price_type="34", preview=preview) # LOC
+            self._buy(half_amount, limit_price_2, f"(전반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
                 
         # 후반전 (진행률 >= 50%)
         else:
             # 큰수 LOC: min(평단*(1+Star%), 현재가*1.15)
             limit_price = min((base_price * (1.0 + star)) + loc_buy_offset, current_price * 1.15)
-            self._buy(self.config.unit_buy_amount, limit_price, f"(후반전) 큰수LOC 매수 ({ORDER_TYPE_MAP['34']})", turn=turn_to_log, price_type="34", preview=preview) # LOC
+            self._buy(self.config.unit_buy_amount, limit_price, f"(후반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
 
     def _save_and_finish(self, current_price: float = 0.0, silent: bool = False, shares=None, avg_price=None):
         # 핵심 수정: 사이클 종료 직전 T(Turn)값 재계산하여 저장 및 로그 반영
@@ -1948,7 +1987,7 @@ class ValueRebalancingEngine:
                     ptype = "00"
                 else:
                     buy_price = 0.0
-                    ptype = "01"
+                    ptype = "03" if self.config.market == "US" else "3"
 
                 if preview:
                     planned_orders.append({
@@ -2106,7 +2145,8 @@ class ValueRebalancingEngine:
             qty_to_buy = int(order_amt / exec_price) if exec_price > 0 else 0
             
             if qty_to_buy > 0:
-                success = self.broker.place_order(self.config.symbol, exec_price, qty_to_buy, "BUY", price_type="01", strategy="VR", strategy_name=self.config.strategy_name)
+                ptype = "03" if self.config.market == "US" else "3"
+                success = self.broker.place_order(self.config.symbol, exec_price, qty_to_buy, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                 if success:
                     logger.info(f"  -> 초기 시장가 매수 체결: {qty_to_buy}주 @ ${exec_price:.2f} (Bootstrap {self.state.bootstrap_day_count + 1}/{self.state.bootstrap_days}일차)")
             

@@ -735,19 +735,19 @@ def cleanup_processed_orders_db():
         return 0
 
 def cleanup_old_canceled_orders_db(days=3):
-    """3일 이상 지난 CANCELED 주문 내역 삭제"""
+    """3일 이상 지난 오래된 주문 내역(CANCELED, FAILED, ORDERED 등 모든 상태) 삭제"""
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(f"DELETE FROM order_history WHERE status='CANCELED' AND timestamp < datetime('now', 'localtime', '-{days} days')")
+        cursor.execute(f"DELETE FROM order_history WHERE timestamp < datetime('now', 'localtime', '-{days} days')")
         count = cursor.rowcount
         conn.commit()
         conn.close()
         if count > 0:
-            logger.info(f"🗑️ [Cleanup] 3일 이상 경과된 취소 주문 {count}건을 삭제했습니다.")
+            logger.info(f"🗑️ [Cleanup] {days}일 이상 경과된 오래된 주문 내역 {count}건을 삭제했습니다.")
         return count
     except Exception as e:
-        logger.error(f"Cleanup old canceled orders failed: {e}")
+        logger.error(f"Cleanup old orders failed: {e}")
         return 0
 
 def sync_open_orders_db(symbol, open_orders):

@@ -432,13 +432,15 @@ class KiwoomUsBroker(Broker):
         logger.error("[US] 예수금 조회 실패")
         return 0.0
 
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         """
         [미국주식] 주문 전송
-        price_type (frgn_trde_tp): 지정가: "00", 시장가: "03", LOC: "30" (키움증권 REST API 명세 기준)
+        매매구분(trde_tp): 00:지정가, 03:시장가, 26:VWAP지정가, 27:TWAP지정가, 30:LOC, 33:MOC, 36:VWAP시장가, 37:TWAP시장가, 35:STOP, 34:STOP LIMIT
         """
+        logger.info(f"🔍 [US API Debug] place_order 호출: symbol={symbol}, price={price}, qty={qty}, order_type={order_type}, price_type={price_type}, strategy={strategy}, strategy_name={strategy_name}, stop_price={stop_price}")
+
         # 모의투자(MOCK) 모드이고 시장가 주문이 요청된 경우, 현재가 기준으로 지정가 호가 보정 우회 처리
-        if self.trade_mode == "MOCK" and price_type in ["01", "3", "03"]:
+        if self.trade_mode == "MOCK" and price_type in ["03", "36", "37"]:
             current_price = self.get_price(symbol)
             if current_price > 0:
                 tick_diff = 0.01 if order_type == "BUY" else -0.01
@@ -461,18 +463,18 @@ class KiwoomUsBroker(Broker):
             else:
                 return f"{p:.2f}"
 
-        # KIS의 "00" 지정가, "01" 시장가, "34" LOC를 키움 규격인 "00", "03", "30"으로 보정
-        if price_type in ["00", "0"]:
-            frgn_trde_tp = "00"
-            ord_uv = format_price(price)
-        elif price_type in ["01", "3"]:
-            frgn_trde_tp = "03"
-            ord_uv = "0.0" # 시장가는 가격 0으로 제출
-        elif price_type in ["34", "30"]:
-            frgn_trde_tp = "30"
-            ord_uv = format_price(price)
+        # 해외매매구분 처리
+        trde_tp = price_type
+
+        # [MOCK US LOC 모사] 모의투자 모드이고 LOC("30") 주문일 경우 지정가("00") 주문으로 우회 변환하여 마감 20분 전에 제출되도록 함
+        if self.trade_mode == "MOCK" and trde_tp == "30":
+            trde_tp = "00"
+            logger.info(f"🔄 [MOCK US LOC 모사] 모의투자 계좌의 LOC 주문을 지정가 {price:.2f}로 변환하여 전송합니다. ({symbol})")
+
+        # 시장가 및 STOP 유형은 가격을 0.0으로 제출
+        if trde_tp in ["03", "36", "37", "35"]:
+            ord_uv = "0.0"
         else:
-            frgn_trde_tp = "00"
             ord_uv = format_price(price)
 
         body = {
@@ -480,23 +482,37 @@ class KiwoomUsBroker(Broker):
             "stk_cd": symbol,
             "ord_qty": str(int(qty)),
             "ord_uv": ord_uv,
-            "trde_tp": frgn_trde_tp
+            "trde_tp": trde_tp
         }
+
+        if action == "SELL":
+            formatted_stop_price = ""
+            if stop_price is not None:
+                formatted_stop_price = format_price(stop_price)
+            elif trde_tp in ["34", "35"]:
+                formatted_stop_price = format_price(price)
+            body["stop_pric"] = formatted_stop_price
+
+        logger.info(f"🔍 [US API Debug] 주문 요청 전송 준비: URL={url}, TR_ID={tr_id}, Body={json.dumps(body)}")
 
         try:
             res = self._call_api("POST", url, tr_id, data=json.dumps(body))
             if not res:
+                logger.error(f"❌ [US API Debug] API 호출 결과가 None입니다. (네트워크/인증 오류 가능성)")
                 return False
+            
+            logger.info(f"🔍 [US API Debug] API 응답 코드: {res.status_code}, 본문: {res.text}")
+            
             data = res.json()
             if data.get('return_code') == 0:
                 odno = data.get('ord_no')
                 logger.info(f"🟢 [US 주문 성공] {strategy} {action} {symbol} {qty}주 @ {price} (주문번호: {odno})")
-                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "ORDERED", odno, "성공", market="US", strategy_name=strategy_name)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "ORDERED", odno, "성공", market="US", strategy_name=strategy_name)
                 return True
             else:
                 msg = data.get('return_msg', '알 수 없는 오류')
                 logger.error(f"🔴 [US 주문 실패] {strategy} {action} {symbol} {qty}주 @ {price} -> {msg}")
-                log_order_db(symbol, strategy, action, price, qty, frgn_trde_tp, "FAILED", "", msg, market="US", strategy_name=strategy_name)
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "FAILED", "", msg, market="US", strategy_name=strategy_name)
                 send_telegram_message(f"🔴 <b>[US 주문 실패]</b>\n종목: {symbol}\n유형: {action}\n사유: {msg}")
                 return False
         except Exception as e:

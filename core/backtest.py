@@ -2,7 +2,7 @@ import os
 import sys
 import pandas as pd
 import math
-from typing import Tuple, List, Literal, Union
+from typing import Tuple, List, Literal, Union, Optional
 
 # 프로젝트 루트를 sys.path에 추가
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -137,7 +137,7 @@ class BacktestBroker(Broker):
             return float(math.floor(price / tick) * tick)
 
 # BacktestBroker.place_order 메서드 재작성 (깔끔한 버전)
-    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL") -> bool:
+    def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         if qty <= 0: return False
         qty = int(qty) # 수량을 정수로 내림 처리 (KR 시장 호환 및 정수 거래 원칙)
         if qty <= 0: return False
@@ -152,16 +152,16 @@ class BacktestBroker(Broker):
         curr_low = float(row['Low'])
 
         can_execute = False
-        if price_type in ["00", "LIMIT"]: # 지정가 주문
+        if price_type in ["00", "0", "LIMIT"]: # 지정가 주문
             if order_type == "BUY":
                 if curr_low <= price: can_execute = True # 저가가 주문가보다 낮아야 체결
             else: # SELL
                 if curr_high >= price: can_execute = True # 고가가 주문가보다 높아야 체결
-        elif price_type in ["34", "33", "LOC", "MOC"]: # 종가 관련 주문
+        elif price_type in ["30", "34", "33", "LOC", "MOC"]: # 종가 관련 주문
             if order_type == "BUY":
-                if curr_close <= price or price_type == "33": can_execute = True
+                if curr_close <= price or price_type in ["33", "MOC"]: can_execute = True
             else: # SELL
-                if curr_close >= price or price_type == "33": can_execute = True
+                if curr_close >= price or price_type in ["33", "MOC"]: can_execute = True
             price = curr_close # 종가 거래는 항상 종가로 가격 확정
         else: # 기타 (시장가 등)
             can_execute = True
