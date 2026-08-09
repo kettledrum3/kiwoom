@@ -2222,8 +2222,9 @@ if mode == "실전 투자":
                 # 여기서는 Config 값을 알 수 없으므로 사이드바 입력을 사용
                 # (주의: 사이드바 입력과 실제 실행 설정이 다를 수 있음)
                 
-                term = (current_t / 2.0) * (40 / db_a_default) 
-                star_pct = db_target_profit - (term / 100.0)
+                star_pct = db_target_profit * (1.0 - (current_t / 20.0) * (40.0 / db_a_default))
+                star_pct = round(star_pct, 9)
+                star_pct = math.ceil(star_pct * 10000) / 10000.0
                 cur_sym = currency_symbol
                 
                 st.write(f"현재 T: **{current_t:.1f}** | Star%: **{star_pct*100:.2f}%** | 1회 매수금: **{cur_sym}{format_currency(unit_buy, market_code)}**")
