@@ -601,16 +601,35 @@ class KisWebSocketClient:
             else:
                 exec_qty_str = values.get('900') or values.get('911')
                 
-            exec_price_str = values.get('910')
+            # 체결 단계일 때는 체결단가(910)를 사용하고, 접수 등 비체결 단계일 때는 주문단가(901)를 우선 사용
+            if cntg_div == "02":
+                exec_price_str = values.get('910') or values.get('901')
+            else:
+                exec_price_str = values.get('901') or values.get('910')
+
+            # 만약 여전히 가격이 0이거나 없다면 order_history DB에서 주문단가 조회
+            if (not exec_price_str or float(exec_price_str or 0) <= 0) and odno:
+                try:
+                    from core.database import get_connection
+                    conn_tmp = get_connection()
+                    cur_tmp = conn_tmp.cursor()
+                    cur_tmp.execute("SELECT price FROM order_history WHERE odno=?", (odno,))
+                    row_p = cur_tmp.fetchone()
+                    if row_p and row_p[0] and float(row_p[0]) > 0:
+                        exec_price_str = str(row_p[0])
+                    conn_tmp.close()
+                except Exception:
+                    pass
+
             side_raw = values.get('907') # 1:매도, 2:매수
             exec_time = values.get('908') # HHmmss
             order_div_cd = str(values.get('906') or "") # 매매구분명 또는 코드
             
-            if not exec_qty_str or not exec_price_str:
+            if not exec_qty_str:
                 return
                 
             exec_qty = int(float(exec_qty_str))
-            exec_price = float(exec_price_str)
+            exec_price = float(exec_price_str or 0.0)
             order_type = "SELL" if side_raw == "1" else "BUY"
 
             logger.debug(f"[WS] {self.market} Parsed Fields: odno={odno}, order_type={order_type}, symbol={symbol}, exec_qty={exec_qty}, exec_price={exec_price}, status={status_text}")

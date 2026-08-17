@@ -2369,6 +2369,40 @@ if mode == "실전 투자":
                 # 3. 거래 내역표
                 st.markdown("##### 📜 거래 내역 (Detailed Trade History)")
 
+                col_sync_btn, col_sync_info = st.columns([1, 2])
+                with col_sync_btn:
+                    if st.button("🔄 실시간 계좌 거래내역 동기화", key=f"sync_trade_btn_ca_{symbol}", help="증권사 API로부터 최근 체결 내역 및 잔고를 가져와 DB와 동기화합니다."):
+                        with st.spinner(f"[{market_code}] 증권사 API 체결 내역 및 잔고 동기화 중..."):
+                            broker = ActiveBroker
+                            start_date_sync = (datetime.now() - timedelta(days=14)).strftime("%Y%m%d")
+                            end_date_sync = datetime.now().strftime("%Y%m%d")
+                            execs = broker.fetch_execution_history(symbol, start_date_sync, end_date_sync)
+                            sync_trade_history_db(symbol, execs, strategy="CA", market=market_code, strategy_name=strategy_alias)
+                            
+                            # 잔고 및 예수금 동기화
+                            pool = broker.get_cash_pool()
+                            equity_res = broker.get_account_equity(symbol)
+                            if equity_res is not None:
+                                shares_live, avg_price_live, eval_amt_live = equity_res
+                                current_price_live = broker.get_price(symbol)
+                                prev_close_live = broker.get_previous_close(symbol)
+                                st.session_state['live_account'] = {
+                                    'pool': pool,
+                                    'broker_cash': pool,
+                                    'shares': shares_live,
+                                    'avg_price': avg_price_live,
+                                    'eval_amt': eval_amt_live,
+                                    'current_price': current_price_live,
+                                    'prev_close': prev_close_live,
+                                    'symbol': symbol,
+                                    'market_code': market_code,
+                                    'time': time.strftime("%H:%M:%S")
+                                }
+                            st.success("✅ 거래 내역 및 계좌 잔고가 증권사 API와 동기화되었습니다.")
+                            time.sleep(1)
+                            st.rerun()
+                with col_sync_info:
+                    st.caption("💡 증권사 API와 DB 간 체결 내역/잔고 차이가 있을 때 동기화 버튼을 누르세요.")
                 
                 # 위에서 가져온 rows를 재사용하여 상세 내역 표시
                 if rows:
@@ -2782,6 +2816,41 @@ if mode == "실전 투자":
 
                 # 3. 거래 내역표
                 st.markdown("##### 📜 거래 내역 (Detailed Trade History)")
+
+                col_sync_btn_vr, col_sync_info_vr = st.columns([1, 2])
+                with col_sync_btn_vr:
+                    if st.button("🔄 실시간 계좌 거래내역 동기화", key=f"sync_trade_btn_vr_{symbol}", help="증권사 API로부터 최근 체결 내역 및 잔고를 가져와 DB와 동기화합니다."):
+                        with st.spinner(f"[{market_code}] 증권사 API 체결 내역 및 잔고 동기화 중..."):
+                            broker = ActiveBroker
+                            start_date_sync = (datetime.now() - timedelta(days=14)).strftime("%Y%m%d")
+                            end_date_sync = datetime.now().strftime("%Y%m%d")
+                            execs = broker.fetch_execution_history(symbol, start_date_sync, end_date_sync)
+                            sync_trade_history_db(symbol, execs, strategy="VR", market=market_code, strategy_name=strategy_alias)
+                            
+                            # 잔고 및 예수금 동기화
+                            pool = broker.get_cash_pool()
+                            equity_res = broker.get_account_equity(symbol)
+                            if equity_res is not None:
+                                shares_live, avg_price_live, eval_amt_live = equity_res
+                                current_price_live = broker.get_price(symbol)
+                                prev_close_live = broker.get_previous_close(symbol)
+                                st.session_state['live_account'] = {
+                                    'pool': pool,
+                                    'broker_cash': pool,
+                                    'shares': shares_live,
+                                    'avg_price': avg_price_live,
+                                    'eval_amt': eval_amt_live,
+                                    'current_price': current_price_live,
+                                    'prev_close': prev_close_live,
+                                    'symbol': symbol,
+                                    'market_code': market_code,
+                                    'time': time.strftime("%H:%M:%S")
+                                }
+                            st.success("✅ 거래 내역 및 계좌 잔고가 증권사 API와 동기화되었습니다.")
+                            time.sleep(1)
+                            st.rerun()
+                with col_sync_info_vr:
+                    st.caption("💡 증권사 API와 DB 간 체결 내역/잔고 차이가 있을 때 동기화 버튼을 누르세요.")
 
                 # 위에서 가져온 rows를 재사용하여 상세 내역 표시
                 if rows:

@@ -934,22 +934,38 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
             # 날짜: ord_dt 또는 stck_bsop_date
 
             # 체결 시각 추출
-            # REST API (US/KR)는 'ord_tmd'를, 웹소켓은 'exec_time'을 사용 (여기서는 REST API 히스토리 처리)
-            raw_time = ex.get('ord_tmd') or ex.get('ft_ccld_tm') or ex.get('stck_cntg_hour') or '000000'
-            raw_date = ex.get('ord_dt') or ex.get('stck_bsop_date') or ''
-            date_formatted = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}" if len(raw_date) == 8 else raw_date
+            raw_time = ex.get('time') or ex.get('cntr_time') or ex.get('ord_tmd') or ex.get('ft_ccld_tm') or ex.get('stck_cntg_hour') or ex.get('ord_time') or '000000'
+            raw_date = ex.get('date') or ex.get('ord_dt') or ex.get('stck_bsop_date') or datetime.now().strftime("%Y%m%d")
+            
+            # 날짜 포맷팅 (YYYYMMDD -> YYYY-MM-DD)
+            if len(raw_date) == 8 and raw_date.isdigit():
+                date_formatted = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+            elif "-" in raw_date and len(raw_date) >= 10:
+                date_formatted = raw_date[:10]
+            else:
+                date_formatted = datetime.now().strftime("%Y-%m-%d")
 
-            if len(raw_time) == 6:
-                full_time_str = f"{raw_time[:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
-                date_formatted = f"{date_formatted} {full_time_str}" # date 필드에 시각 포함
+            # 시각 포맷팅 (HHMMSS -> HH:MM:SS)
+            clean_time = str(raw_time).replace(":", "").strip()
+            if len(clean_time) == 6 and clean_time.isdigit():
+                full_time_str = f"{clean_time[:2]}:{clean_time[2:4]}:{clean_time[4:6]}"
+                date_formatted = f"{date_formatted} {full_time_str}"
+            elif ":" in str(raw_time):
+                date_formatted = f"{date_formatted} {raw_time}"
             else:
                 date_formatted = f"{date_formatted} 00:00:00"
             
-            side = "BUY" if ex.get('sll_buy_dvsn_cd') in ['02', '2'] else "SELL"
-            # [보강] 필드 매핑 유연화 (US/KR 공용)
-            price = float(ex.get('ft_ccld_unpr3') or ex.get('pndn_unpr') or ex.get('stck_clpr') or 0)
-            qty = float(ex.get('ft_ccld_qty') or ex.get('pndn_qty') or ex.get('stck_clqty') or 0)
-            total_amount_api = float(ex.get('ft_ccld_amt3') or ex.get('pndn_amt') or ex.get('stck_clamt') or 0)
+            # 매매 구분 (BUY / SELL)
+            raw_side = ex.get('side') or ex.get('slby_tp') or ex.get('sll_buy_dvsn_cd') or ''
+            if str(raw_side).upper() in ['BUY', '매수', '2', '02']:
+                side = "BUY"
+            else:
+                side = "SELL"
+
+            # 가격 및 수량 추출
+            price = float(ex.get('price') or ex.get('cntr_uv') or ex.get('ft_ccld_unpr3') or ex.get('pndn_unpr') or ex.get('stck_clpr') or 0.0)
+            qty = float(ex.get('qty') or ex.get('cntr_qty') or ex.get('ft_ccld_qty') or ex.get('pndn_qty') or ex.get('stck_clqty') or 0.0)
+            total_amount_api = float(ex.get('total_amount') or ex.get('ft_ccld_amt3') or ex.get('pndn_amt') or ex.get('stck_clamt') or 0.0)
             principal = price * qty
 
             if qty == 0:

@@ -1674,6 +1674,9 @@ class CostAveragingEngine:
             limit_price_1 = min(base_price, current_price * 1.15)
             self._buy(half_amount, limit_price_1, f"(전반전) 평단가 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
 
+            if not preview:
+                time.sleep(0.5) # API 연속 호출 Rate Limit 방지
+
             # 큰수 LOC: min(평단*(1+Star%), 현재가*1.15)
             limit_price_2 = min((base_price * (1.0 + star)) + loc_buy_offset, current_price * 1.15)
             self._buy(half_amount, limit_price_2, f"(전반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
