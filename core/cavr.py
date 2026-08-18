@@ -689,6 +689,7 @@ class CAState(BaseState):
     # 모드 관리
     mode: str = "NORMAL"       # NORMAL, QUARTER, REVERSE
     quarter_turn: int = 0      # 쿼터손절 모드 진행 회차 (0~10)
+    reverse_cycle_count: int = 0 # 리버스 모드 진행 회차 (0: 첫날, 1 이상: 2회차 이후)
 
     # 장중 매수 관리 (일일 초기화 필요)
     daily_bought_amount: float = 0.0  # 당일 장중 매수 누적액
@@ -762,16 +763,21 @@ class CostAveragingEngine:
         self.state = self._initialize_state()
 
         # State에 저장된 설정이 있으면 Config 덮어씌움 (DB 우선 반영)
-        if self.state.unit_buy_amount > 0:
-            self.config.unit_buy_amount = self.state.unit_buy_amount
-        if hasattr(self.state, 'a_default') and self.state.a_default > 0:
-            self.config.a_default = self.state.a_default
-        if hasattr(self.state, 'target_profit_pct') and self.state.target_profit_pct > 0:
-            self.config.target_profit_pct = self.state.target_profit_pct
-        if hasattr(self.state, 'use_quarter_stop'):
-            self.config.use_quarter_stop = self.state.use_quarter_stop
-        if hasattr(self.state, 'version'):
-            self.config.version = self.state.version
+        if self.config.use_db:
+            if self.state.unit_buy_amount > 0:
+                self.config.unit_buy_amount = self.state.unit_buy_amount
+            if hasattr(self.state, 'a_default') and self.state.a_default > 0:
+                self.config.a_default = self.state.a_default
+            if hasattr(self.state, 'target_profit_pct') and self.state.target_profit_pct > 0:
+                self.config.target_profit_pct = self.state.target_profit_pct
+            if hasattr(self.state, 'use_quarter_stop'):
+                self.config.use_quarter_stop = self.state.use_quarter_stop
+            if hasattr(self.state, 'version') and self.state.version:
+                self.config.version = self.state.version
+        else:
+            self.state.version = self.config.version
+            self.state.target_profit_pct = self.config.target_profit_pct
+            self.state.a_default = self.config.a_default
 
         # Config 자동 보정: unit_buy_amount가 0이면 budget / a_default
         if self.config.unit_buy_amount <= 0 and self.config.a_default > 0:
@@ -929,7 +935,8 @@ class CostAveragingEngine:
     def _buy(self, amount_to_invest: float, price: float, desc: str, turn: float = None, price_type: str = "00", preview: bool = False) -> bool:
         """매수 실행 및 상태 업데이트"""
         # [KR / MOCK US Market Split Logic]
-        is_split_market = self.config.market == "KR" or (self.config.market == "US" and self.broker.trade_mode == "MOCK")
+        broker_trade_mode = getattr(self.broker, 'trade_mode', 'REAL')
+        is_split_market = self.config.market == "KR" or (self.config.market == "US" and broker_trade_mode == "MOCK")
         if self.config.market == "KR" and self.current_order_filter == "SELL_LIMIT_ONLY":
             return False # 오전장: 매수 금지
 
@@ -1010,7 +1017,8 @@ class CostAveragingEngine:
     def _sell(self, qty_to_sell: float, price: float, desc: str, price_type: str = "00", preview: bool = False) -> float:
         """매도 실행 및 손익 계산"""
         # [KR / MOCK US Market Split Logic]
-        is_split_market = self.config.market == "KR" or (self.config.market == "US" and self.broker.trade_mode == "MOCK")
+        broker_trade_mode = getattr(self.broker, 'trade_mode', 'REAL')
+        is_split_market = self.config.market == "KR" or (self.config.market == "US" and broker_trade_mode == "MOCK")
         if is_split_market and self.current_order_filter:
             is_loc_type = "LOC" in desc or "Star%" in desc or price_type == "30"
             if self.current_order_filter == "LIMIT_ONLY" and is_loc_type:
@@ -1252,24 +1260,29 @@ class CostAveragingEngine:
         
         self.current_order_filter = order_filter
 
-        # [V4.0 전용] 유동적 1회 매수금 계산: 잔금 / (a - T)
-        if self.config.version == "V4.0" and self.state.mode != "REVERSE":
-            available_slots = self.config.a_default - self.state.current_turn
-            if available_slots > 0:
-                # [중요] 1회 매수금을 매일 재계산하여 유동성 부여
-                invested = self.state.total_shares * self.state.avg_price
-                s_pool = max(0.0, self.state.pool - invested)
-                self.config.unit_buy_amount = s_pool / available_slots
-                self.state.unit_buy_amount = self.config.unit_buy_amount # 상태 필드도 업데이트
-                logger.info(f"📍 [V4.0] 유동 매수액 재계산: {self.config.unit_buy_amount:,.2f} (s_pool: {s_pool:,.2f}, 남은회차: {available_slots:.2f})")
-            if self.state.current_turn > (self.config.a_default - 1):
-                if self.state.mode != "REVERSE" and not preview:
-                    send_telegram_message(f"🚨 <b>[CA V4.0 리버스 모드 가동]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n예산 소진(T > {self.config.a_default - 1})에 따라 리버스 모드로 전환합니다.")
-                self.state.mode = "REVERSE"
-
-        # [ADD] SELL_LIMIT_ONLY 필터인 경우 매수 로직은 건너뜁니다.
+        # [ADD] SELL_LIMIT_ONLY 필터인 경우
         if order_filter == "SELL_LIMIT_ONLY":
+            if self.state.mode == "REVERSE":
+                logger.info(f"[{self.config.symbol}] 리버스 모드 상태이므로 SELL_LIMIT_ONLY(75% 지정가 매도) 작업을 건너뜁니다.")
+                return None
             logger.info(f"[{self.config.symbol}] SELL_LIMIT_ONLY 필터 적용. 매수 로직은 건너뜁니다.")
+
+        # [V4.0 전용] 유동적 1회 매수금 계산 및 리버스 모드 진입 판정
+        if self.config.version == "V4.0":
+            if self.state.mode != "REVERSE":
+                available_slots = self.config.a_default - self.state.current_turn
+                if available_slots > 0:
+                    # [중요] 1회 매수금을 매일 재계산하여 유동성 부여
+                    invested = self.state.total_shares * self.state.avg_price
+                    s_pool = max(0.0, self.state.pool - invested)
+                    self.config.unit_buy_amount = s_pool / available_slots
+                    self.state.unit_buy_amount = self.config.unit_buy_amount # 상태 필드도 업데이트
+                    logger.info(f"📍 [V4.0] 유동 매수액 재계산: {self.config.unit_buy_amount:,.2f} (s_pool: {s_pool:,.2f}, 남은회차: {available_slots:.2f})")
+                if self.state.current_turn >= (self.config.a_default - 1):
+                    if self.state.mode != "REVERSE" and not preview:
+                        send_telegram_message(f"🚨 <b>[CA V4.0 리버스 모드 가동]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n예산 소진(T >= {self.config.a_default - 1})에 따라 리버스 모드로 전환합니다.")
+                    self.state.mode = "REVERSE"
+                    self.state.reverse_cycle_count = 0
 
         # 시작 시 중복 주문 체크 (Preview일때는 무시하거나 체크만 로그)
         if check_existing_orders:
@@ -1457,64 +1470,109 @@ class CostAveragingEngine:
         return None
 
     def _run_reverse_mode_routine(self, current_price: float, date, preview: bool = False):
-        """V4.0 리버스 모드(소진 모드) 실행 로직"""
+        """V4.0 리버스 모드(Reverse Mode) 실행 로직"""
         # [KR Market Split Logic] 한국 시장의 경우 15:10(LOC_ONLY) 세션에서만 실행
         if self.config.market == "KR":
             if self.current_order_filter == "SELL_LIMIT_ONLY":
                 logger.info(f"[{self.config.symbol}] 리버스 모드 - 오전 세션 스킵 (15:10에 실행 예정)")
                 return None
 
-        logger.info(f"🔄 [{self.config.symbol}] 리버스 모드 가동 중... (T={self.state.current_turn:.2f})")
+        logger.info(f"🔄 [{self.config.symbol}] 리버스 모드 가동 중... (T={self.state.current_turn:.2f}, 회차={self.state.reverse_cycle_count})")
         
-        # 1. 종료 조건 확인: 종가가 평단 대비 회복되었는지 (TQQQ -15%, SOXL -20% 등)
-        recovery_threshold = -0.15 if "TQQQ" in self.config.symbol else -0.20
-        loss_pct = (current_price - self.state.avg_price) / self.state.avg_price if self.state.avg_price > 0 else 0
+        # 1. 종료(회귀) 조건 확인: 종가(현재가)가 평단가 대비 (-)목표수익률 이상으로 회복 시 일반 모드로 복귀
+        # target_profit_pct 정규화 (0.10 또는 10.0 모두 대응)
+        target_pct = self.config.target_profit_pct
+        effective_target_pct = target_pct if target_pct < 1.0 else target_pct / 100.0
+        escape_price = self.state.avg_price * (1.0 - effective_target_pct)
         
-        if loss_pct > recovery_threshold:
-            logger.info(f"✨ 리버스 모드 종료 및 일반 모드 회귀 (손실률 {loss_pct*100:.2f}% > {recovery_threshold*100:.2f}%)")
-            if not preview: send_telegram_message(f"✨ <b>[CA V4.0 일반 모드 복귀]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n주가 회복(손실률 {loss_pct*100:.2f}%)에 따라 리버스 모드를 종료합니다.")
-            self.state.mode = "NORMAL"
-            return self.run_cycle(date, preview=preview)
-
-        # 2. 리버스 별지점 설정: 직전 5거래일 종가 평균 (실제 구현 시 브로커를 통해 5일치 데이터를 가져와야 함)
-        # 여기선 단순화를 위해 현재가와 캐시된 가격 활용 (추후 고도화 필요)
-        self.state.reverse_star_price = current_price # Fallback
-        
-        # 3. 매도 로직 (무한 매도)
-        total_qty = self.state.total_shares
-        sell_unit_divisor = self.config.a_default / 2
-        # [점검] math.floor를 사용하여 소수점 이하를 버리고 항상 자연수 수량을 산출합니다.
-        sell_qty = math.floor(total_qty / sell_unit_divisor)
-
-        if sell_qty > 0:
-            # 첫날은 MOC(시장가), 이후는 별지점 LOC
-            is_first_day = self.state.current_turn > (self.config.a_default - 0.1) # 소진 직후
-            if self.config.market == "US":
-                p_type = "03" if is_first_day else "30"
-            else:
-                p_type = "3" if is_first_day else "0"
-            desc = "리버스 처음매도(MOC)" if is_first_day else "리버스 무한매도(LOC)"
-            
-            profit = self._sell(sell_qty, self.state.reverse_star_price, desc, price_type=p_type, preview=preview)
+        if self.state.avg_price > 0 and current_price >= escape_price:
+            profit_rate = (current_price - self.state.avg_price) / self.state.avg_price
+            logger.info(f"✨ 리버스 모드 종료 및 일반 모드 회귀 (현재가 {current_price:.2f} >= 탈출가 {escape_price:.2f}, 손익률 {profit_rate*100:.2f}% >= -{effective_target_pct*100:.2f}%)")
             if not preview:
-                # T값 업데이트: T * (1 - 1/(a/2))
-                self.state.current_turn *= (1 - (1 / sell_unit_divisor))
+                send_telegram_message(
+                    f"✨ <b>[CA V4.0 일반 모드 복귀]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n"
+                    f"주가 회복(현재가: {current_price:.2f} >= 탈출가: {escape_price:.2f}, 손익률: {profit_rate*100:.2f}%)에 따라 리버스 모드를 종료하고 일반 모드로 복귀합니다."
+                )
+            self.state.mode = "NORMAL"
+            self.state.reverse_cycle_count = 0
+            # 복귀 시 리버스 모드의 T값과 유동적 매수금 공식을 그대로 계승하여 즉시 일반 사이클 실행
+            return self.run_cycle(date, preview=preview, order_filter=self.current_order_filter)
 
-        # 4. 매수 로직 (쿼터 매수): 둘째날부터 잔금/4 만큼 별지점 아래에서 매수
-        is_first_day = self.state.current_turn > (self.config.a_default - 0.1)
-        if not is_first_day and self.state.pool > 0:
-            buy_budget = self.state.pool / 4
-            buy_price = self.state.reverse_star_price * 0.9999 # 별지점 아래
-            
-            ptype = "30" if self.config.market == "US" else "0"
-            if self._buy(buy_budget, buy_price, "리버스 쿼터매수(LOC)", price_type=ptype, preview=preview):
+        # 2. 리버스 별지점(MA5) 설정: 직전 5거래일 종가 평균
+        ma5 = self.broker.get_last_5_day_avg_close(self.config.symbol)
+        if ma5 <= 0:
+            ma5 = current_price  # Fallback
+        self.state.reverse_star_price = ma5
+        
+        # 3. 매도 분할 비율: 1 / (a/2) (40분할 시 5%, 20분할 시 10%, 내림 처리)
+        total_qty = self.state.total_shares
+        sell_unit_divisor = self.config.a_default / 2.0
+        sell_qty = math.floor(total_qty / sell_unit_divisor)
+        
+        is_first_day = (self.state.reverse_cycle_count == 0)
+        
+        # 4. 첫날 vs 2회차 이후 분기 실행
+        if is_first_day:
+            # === [첫날 (1회차)] ===
+            # 전체 수량의 1 / (a/2) 분량을 MOC(시장가) 강제 매도, 매수는 없음
+            if sell_qty > 0:
+                p_type = "33" if self.config.market == "US" else "3"
+                desc = "리버스 첫날 강제매도(MOC)"
+                sell_price = self._round_price(current_price, "SELL")
+                self._sell(sell_qty, sell_price, desc, price_type=p_type, preview=preview)
                 if not preview:
-                    # T값 업데이트: T + (a-T)*0.25
-                    self.state.current_turn += (self.config.a_default - self.state.current_turn) * 0.25
+                    # T값 수식: T_new = T_old * (1 - 1 / (a/2))
+                    self.state.current_turn *= (1.0 - (1.0 / sell_unit_divisor))
+            
+            if not preview:
+                self.state.reverse_cycle_count += 1
+                self._save_and_finish(current_price=current_price)
+            return self.planned_orders if preview else None
+        else:
+            # === [2회차 이후] ===
+            # (1) 직전 5거래일 종가평균(MA5) 위에서 직전 수량의 1 / (a/2) LOC 매도
+            if sell_qty > 0:
+                sell_price = self._round_price(ma5, "SELL")
+                if self.config.market == "US":
+                    p_type = "30"  # 미국 정식 LOC 주문
+                    self._sell(sell_qty, sell_price, "리버스 무한매도(LOC)", price_type=p_type, preview=preview)
+                    if not preview:
+                        self.state.current_turn *= (1.0 - (1.0 / sell_unit_divisor))
+                else:
+                    # 국내주식: 장마감 직전(15:15~15:20) 현재가와 MA5 비교하여 LOC 모사 발주
+                    # 현재가가 MA5 이상이면 매도 발주
+                    if current_price >= ma5 or preview:
+                        p_type = "3" if not preview else "0"  # 실전: 시장가 체결, 프리뷰: 지정가 표시
+                        self._sell(sell_qty, sell_price, "리버스 무한매도(LOC 모사)", price_type=p_type, preview=preview)
+                        if not preview:
+                            self.state.current_turn *= (1.0 - (1.0 / sell_unit_divisor))
 
-        if not preview:
-            self._save_and_finish(current_price=current_price)
-        return self.planned_orders if preview else None
+            # (2) MA5 아래에서 가용 Pool 25% LOC 쿼터 매수
+            # 가용 Pool 확인 (state.pool)
+            available_pool = self.state.pool if self.state.pool > 0 else 0.0
+            if available_pool > 0:
+                buy_budget = available_pool * 0.25
+                buy_price = self._round_price(ma5 * 0.9999, "BUY")  # MA5 바로 아래 호가
+                
+                if self.config.market == "US":
+                    ptype = "30"  # 미국 정식 LOC 주문
+                    if self._buy(buy_budget, buy_price, "리버스 쿼터매수(LOC)", price_type=ptype, preview=preview):
+                        if not preview:
+                            # T값 수식: T_new = T_old + (a - T_old) * 0.25
+                            self.state.current_turn += (self.config.a_default - self.state.current_turn) * 0.25
+                else:
+                    # 국내주식: 장마감 직전(15:15~15:20) 현재가와 MA5 비교하여 LOC 모사 발주
+                    # 현재가가 MA5 이하이면 매수 발주
+                    if current_price <= ma5 or preview:
+                        ptype = "3" if not preview else "0"  # 실전: 시장가 체결, 프리뷰: 지정가 표시
+                        if self._buy(buy_budget, buy_price, "리버스 쿼터매수(LOC 모사)", price_type=ptype, preview=preview):
+                            if not preview:
+                                self.state.current_turn += (self.config.a_default - self.state.current_turn) * 0.25
+            
+            if not preview:
+                self.state.reverse_cycle_count += 1
+                self._save_and_finish(current_price=current_price)
+            return self.planned_orders if preview else None
 
     def _check_and_sell(self, current_price: float, date, preview: bool = False) -> bool:
         """매도 및 모드 변경 조건 확인 및 실행"""
@@ -1688,9 +1746,9 @@ class CostAveragingEngine:
             self._buy(self.config.unit_buy_amount, limit_price, f"(후반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
 
     def _save_and_finish(self, current_price: float = 0.0, silent: bool = False, shares=None, avg_price=None):
-        # 핵심 수정: 사이클 종료 직전 T(Turn)값 재계산하여 저장 및 로그 반영
-        # [최적화] 이미 확보된 잔고 정보가 있다면 활용하여 TPS 부하 감소
-        self._update_current_turn_from_broker(shares=shares, avg_price=avg_price)
+        # 핵심 수정: 사이클 종료 직전 T(Turn)값 재계산하여 저장 및 로그 반영 (리버스 모드일 때는 수식 T값 보존)
+        if self.state.mode != "REVERSE":
+            self._update_current_turn_from_broker(shares=shares, avg_price=avg_price)
         self.state.unit_buy_amount = self.config.unit_buy_amount # Update in state
          
         # 상세 파라미터 상태 보고 준비 (당일 고정값 우선 표시)
