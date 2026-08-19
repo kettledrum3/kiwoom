@@ -2619,8 +2619,16 @@ if mode == "실전 투자":
                 if g_coeff <= 0: g_coeff = 10.0
                 p_accum = state_data.get('periodic_accumulation', 0.0)
                 
+                # V1 기준값 산출: BOOTSTRAP 모드이거나 V1이 초기 원금 대비 비정상적으로 왜곡된 경우 초기 투자금으로 보정
+                v1_base = current_v
+                ib_val = state_data.get('initial_budget', 0.0)
+                if ib_val > 0 and (mode_val == 'BOOTSTRAP' or v1_base <= 0 or v1_base < ib_val * 0.4):
+                    v1_base = ib_val
+
                 # 다음 사이클 예상 목표 V (V2) 계산 시뮬레이션
-                v2_val = current_v + (live_pool / g_coeff) + ((current_eval - current_v) / (2.0 * math.sqrt(g_coeff))) + p_accum
+                term1_val = live_pool / g_coeff
+                term2_val = (current_eval - v1_base) / (2.0 * math.sqrt(g_coeff))
+                v2_val = v1_base + term1_val + term2_val + p_accum
                 
                 st.markdown("##### 🧮 VR 실력공식 구성 변수 (Skill Formula Components)")
                 formula_df = {
@@ -2634,7 +2642,7 @@ if mode == "실전 투자":
                     ],
                     "변수명": ["V1", "Pool", "G", "E", "Contribution", "V2"],
                     "값 / 수치": [
-                        f"{currency_symbol}{format_currency(current_v, market_code)}",
+                        f"{currency_symbol}{format_currency(v1_base, market_code)}",
                         f"{currency_symbol}{format_currency(live_pool, market_code)}",
                         f"{g_coeff:.0f}",
                         f"{currency_symbol}{format_currency(current_eval, market_code)}",
@@ -2643,9 +2651,9 @@ if mode == "실전 투자":
                     ],
                     "수식 기여분": [
                         "기준값",
-                        f"+{currency_symbol}{format_currency(live_pool / g_coeff, market_code)}",
+                        f"+{currency_symbol}{format_currency(term1_val, market_code)}",
                         "수축/이완 조절",
-                        f"{'+' if (current_eval - current_v) >= 0 else ''}{currency_symbol}{format_currency((current_eval - current_v) / (2.0 * math.sqrt(g_coeff)), market_code)}",
+                        f"{'+' if term2_val >= 0 else ''}{currency_symbol}{format_currency(term2_val, market_code)}",
                         f"+{currency_symbol}{format_currency(p_accum, market_code)}",
                         "다음 사이클 시작 시 갱신값"
                     ]

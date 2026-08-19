@@ -12,7 +12,7 @@ from datetime import datetime, time as dtime, timedelta, date
 import threading
 from pytz import timezone
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple, Literal
+from typing import Optional, List, Tuple, Literal, Dict
 
 from core.database import save_state_db, load_state_db, log_trade_db, log_order_db, init_db, finish_strategy_db, get_next_strategy_name
 from core.database import save_api_token_db, load_api_token_db, delete_api_token_db # ADDED: delete 추가
@@ -752,6 +752,7 @@ def save_state(state: BaseState, path: str):
 # ==============================================================================
 
 _ca_intraday_lock = threading.Lock() # ADDED: 장중 체크 동시성 제어용 락
+_active_intraday_timers: Dict[str, threading.Timer] = {} # ADDED: 종목/전략별 활성 지연 타이머 관리
 
 class CostAveragingEngine:
     """무한매수법(CA) V2.2 실행 로직 (backtest_v2_2.py 기반 재구성)"""
@@ -1085,7 +1086,8 @@ class CostAveragingEngine:
     def run_intraday_check(self, current_price: float = None, prev_close: float = None):
         """
         장중 주가 확인 및 추가 매수 로직 (동적 기준점 적용)
-        조건: 기준가 대비 -5% 하락 시마다 1주 매수-->0.5T 분량(체결 시 해당 가격이 새 기준가)
+        조건: 기준가 대비 -5% 하락 시마다 0.5T 분량 매수(체결 시 해당 가격이 새 기준가)
+        장 시작 직후 틱 러쉬 및 변동성 오작동 방지를 위해 KR 09:05, US 09:35부터 감시 수행
         """
         # 1. 락 외부에서 API 조회가 필요할 시 선수행하여 락 점유 시간을 최소화 및 블로킹을 방지합니다.
         if current_price is None or current_price <= 0:
@@ -1103,19 +1105,19 @@ class CostAveragingEngine:
 
         # 2. 동시성 제어를 위해 락 획득 후 모든 조건 검사 및 상태 변경을 원자적으로 수행합니다.
         with _ca_intraday_lock:
+            # DB 모드인 경우 최신 상태를 즉시 다시 로드하여 동시성 레이스 컨디션 및 구 상태 덮어쓰기 방지
+            if self.config.use_db:
+                state_data = load_state_db(self.config.symbol, self.config.strategy_type, market=self.config.market, strategy_name=self.config.strategy_name)
+                if state_data:
+                    state_data.pop('updated_at', None)
+                    self.state = CAState(**state_data)
+
             # 시장별 타임존을 기준으로 날짜를 확인하여 초기화
             market_tz = pytz.timezone('Asia/Seoul') if self.config.market == "KR" else pytz.timezone('America/New_York')
             now_dt = datetime.now(market_tz)
             today_str = now_dt.strftime("%Y-%m-%d")
 
-            if self.config.market == "KR":
-                reg_open, reg_close = dtime(9, 0), dtime(15, 30)
-            else:
-                reg_open, reg_close = dtime(9, 30), dtime(16, 0)
-            
-            if not (reg_open <= now_dt.time() <= reg_close):
-                return
-
+            # 날짜 변경 시 장중 매수 상태 초기화는 안전하게 수행
             if self.state.last_check_date != today_str:
                 self.state.daily_bought_amount = 0.0
                 self.state.last_intraday_level = 0
@@ -1123,11 +1125,22 @@ class CostAveragingEngine:
                 self.state.last_check_date = today_str
                 self.state.intraday_drop_pending = False
                 self.state.intraday_drop_pending_time = 0.0
+                timer_key = f"{self.config.market}_{self.config.symbol}_{self.config.strategy_name}"
+                _active_intraday_timers.pop(timer_key, None)
                 if self.config.use_db:
                     save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name, only_if_exists=True)
                 else:
                     save_state(self.state, self.config.save_path)
                 logger.info(f"[{today_str}] {self.config.symbol} 장중 매수 상태 초기화 완료")
+
+            # [개장 러쉬 방지] 정규장 개장 직후 5분간의 변동성/틱 러쉬를 피하기 위해 KR 09:05, US 09:35부터 감시 진행
+            if self.config.market == "KR":
+                reg_open_check, reg_close = dtime(9, 5), dtime(15, 30)
+            else:
+                reg_open_check, reg_close = dtime(9, 35), dtime(16, 0)
+            
+            if not (reg_open_check <= now_dt.time() <= reg_close):
+                return
 
             if getattr(self.state, 'pending_cycle_transition', False):
                 return
@@ -1135,14 +1148,19 @@ class CostAveragingEngine:
             if self.state.mode == "REVERSE":
                 return
 
-            # 급락 펜딩 플래그 감지 시 타임아웃(60초) 여부 확인
+            # 활성 타이머 및 급락 펜딩 플래그 감지 시 타임아웃(60초) 여부 확인
+            timer_key = f"{self.config.market}_{self.config.symbol}_{self.config.strategy_name}"
+            active_timer = _active_intraday_timers.get(timer_key)
+            is_timer_running = active_timer is not None and active_timer.is_alive()
+
             is_pending = getattr(self.state, 'intraday_drop_pending', False)
             pending_time = getattr(self.state, 'intraday_drop_pending_time', 0.0)
-            if is_pending:
+            if is_pending or is_timer_running:
                 if time.time() - pending_time > 60:
                     logger.warning(f"⚠️ [장중 급락 감시] {self.config.symbol} 펜딩 상태가 60초 초과되어 해제합니다.")
                     self.state.intraday_drop_pending = False
                     self.state.intraday_drop_pending_time = 0.0
+                    _active_intraday_timers.pop(timer_key, None)
                 else:
                     # 아직 10초 대기 중이거나 처리 중이므로 스킵
                     return
@@ -1188,15 +1206,18 @@ class CostAveragingEngine:
                 else:
                     save_state(self.state, self.config.save_path)
                 
-                # 10초 후 시장가(01) 매수 실행 예약
-                threading.Timer(
+                # 10초 후 시장가(01) 매수 실행 예약 및 활성 타이머 등록
+                timer = threading.Timer(
                     10.0, 
                     self._delayed_intraday_market_buy, 
                     args=(buy_amount, current_price, display_drop_rate, trigger_base, effective_prev_close)
-                ).start()
+                )
+                _active_intraday_timers[timer_key] = timer
+                timer.start()
 
     def _delayed_intraday_market_buy(self, buy_amount: float, trigger_price: float, display_drop_rate: float, trigger_base: float, effective_prev_close: float):
         """급락 감지 10초 후 시장가(01) 매수를 실행하는 지연 메서드"""
+        timer_key = f"{self.config.market}_{self.config.symbol}_{self.config.strategy_name}"
         try:
             with _ca_intraday_lock:
                 # DB 모드인 경우 최신 상태를 먼저 로드하여 동기화
@@ -1252,6 +1273,8 @@ class CostAveragingEngine:
                     save_state(self.state, self.config.save_path)
         except Exception as e:
             logger.error(f"❌ [지연 장중 급락 매수 오류] {self.config.symbol}: {e}", exc_info=True)
+        finally:
+            _active_intraday_timers.pop(timer_key, None)
 
     def run_cycle(self, date, check_existing_orders: bool = False, preview: bool = False, order_filter: Literal["LIMIT_ONLY", "LOC_ONLY", None] = None, transition_only: bool = False):
         """무한매수법 1회 사이클 실행 (일별 로직)"""
@@ -1800,12 +1823,13 @@ class ValueRebalancingEngine:
 
         self.state = self._initialize_state()
 
-        # [자가 치유] 과거 데이터 누락으로 인해 V, cycle_V, pool 등이 0.0으로 저장되어 있는 경우 
-        # 설정된 initial_budget 값을 바탕으로 강제 보정 및 복구하여 전략이 즉시 정상 구동되도록 유도합니다.
-        if self.config.use_db and self.state and self.state.mode != 'BOOTSTRAP':
+        # [자가 치유] 과거 데이터 누락 또는 초기 왜곡으로 인해 V, cycle_V 등이 비정상적으로 저장되어 있는 경우 
+        # 설정된 initial_budget과 실력공식을 바탕으로 강제 보정 및 복구하여 전략이 즉시 정상 구동되도록 유도합니다.
+        if self.config.use_db and self.state:
             has_changed = False
-            ib = self.state.initial_budget if self.state.initial_budget > 0 else self.config.initial_budget
+            ib = float(self.state.initial_budget) if getattr(self.state, 'initial_budget', 0.0) > 0 else float(self.config.initial_budget)
             
+            # 1. 0.0으로 유실된 경우 복구
             if self.state.V == 0.0 and ib > 0:
                 self.state.V = ib
                 has_changed = True
@@ -1819,9 +1843,37 @@ class ValueRebalancingEngine:
                 self.state.cycle_start_pool = ib
                 has_changed = True
                 
+            # 2. [빌드업 완료 후 V 재계산/왜곡 치유] 
+            # BOOTSTRAP이 완료(day_count >= days 또는 RUNNING)되었으나 V가 initial_budget과 동일(미계산)하거나 40% 미만으로 왜곡된 경우 복구
+            is_boot_done = (getattr(self.state, 'mode', 'RUNNING') == 'RUNNING' and getattr(self.state, 'bootstrap_day_count', 0) >= getattr(self.state, 'bootstrap_days', 10))
+            is_uncalculated_or_distorted = (self.state.V < ib * 0.4 or self.state.cycle_V < ib * 0.4 or (is_boot_done and abs(self.state.V - ib) < 0.01))
+            
+            if ib > 0 and is_uncalculated_or_distorted:
+                g_c = float(getattr(self.state, 'G', 10.0))
+                if g_c <= 0: g_c = 10.0
+                curr_pool = float(self.state.pool) if self.state.pool > 0 else (ib * 0.1)
+                
+                # 최신 평가금 조회 시도
+                equity_res = self.broker.get_account_equity(self.config.symbol)
+                if equity_res and equity_res[2] > 0:
+                    curr_eval = float(equity_res[2])
+                elif getattr(self.state, 'last_E', 0.0) > 0:
+                    curr_eval = float(self.state.last_E)
+                else:
+                    curr_eval = ib * 0.5
+                    
+                p_accum = float(getattr(self.state, 'periodic_accumulation', 0.0))
+                term1 = curr_pool / g_c
+                term2 = (curr_eval - ib) / (2.0 * math.sqrt(g_c))
+                restored_V = round(ib + term1 + term2 + p_accum, 2)
+                
+                logger.info(f"🔧 [Self-Healing] {self.state.symbol} VR 전략의 V(${self.state.V:,.2f})를 초기 원금(${ib:,.2f}) 기준 실력공식(${restored_V:,.2f})으로 자가 복구합니다.")
+                self.state.V = restored_V
+                self.state.cycle_V = restored_V
+                self.state.last_E = curr_eval
+                has_changed = True
+
             if has_changed:
-                logger.info(f"🔧 [Self-Healing] {self.state.symbol} VR 전략의 V/Pool 데이터 유실 감지 -> initial_budget ({ib}) 으로 복구 저장합니다.")
-                from core.database import save_state_db
                 save_state_db(self.state, market=self.config.market, strategy_name=self.config.strategy_name)
 
         # State에 저장된 설정이 있으면 Config 덮어씌움
@@ -1875,10 +1927,9 @@ class ValueRebalancingEngine:
         # 2. 초기 잔고 계산 (E = 잔고 * 평균매입단가)
         E = shares * avg_price
         
-        # 3. 1회차 V_2 계산 공식 적용: V_1 = 0, P = initial_pool, G = G
-        # V_2 = 0 + Pool/G + E / (2 * sqrt(G))
+        # 3. 초기 목표 밸류(V)는 총 투자 원금(initial_budget)으로 시작합니다.
         G = self.config.G if self.config.G > 0 else 10.0
-        initial_V = (initial_pool / G) + (E / (2.0 * math.sqrt(G)))
+        initial_V = self.config.initial_budget if self.config.initial_budget > 0 else (initial_pool + E)
 
         # 4. 가변 Bootstrap 조건 및 진입 여부 판별
         low_band = initial_V * (self.config.band_low_pct / 100.0)
@@ -1948,6 +1999,11 @@ class ValueRebalancingEngine:
 
     def _update_V_skill(self, E: float, contribution: float = 0.0) -> float:
         V1 = self.state.V
+        ib = getattr(self.state, 'initial_budget', 0.0)
+        # V1이 초기 원금 대비 비정상적으로 왜곡된 경우 초기 투자금으로 보정
+        if ib > 0 and (V1 <= 0 or V1 < ib * 0.4):
+            V1 = ib
+
         pool = self.state.pool
         G = self.config.G
         # G가 0이 되는 경우 방지
@@ -2007,13 +2063,13 @@ class ValueRebalancingEngine:
             prev_close = self.broker.get_previous_close(symbol)
             cur_sym = "₩" if self.config.market == "KR" else "$"
             def fmt_price(v):
-                if self.config.market == "KR": return f"{int(v):,}"
-                return f"{v:,.2f}"
+                if self.config.market == "KR": return f"{int(round(float(v))):,}"
+                return f"{float(v):,.2f}"
                 
             msg = f"📅 <b>[VR 사이클 갱신]</b> {symbol_display}\n"
             msg += f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             msg += f"전날 종가: {cur_sym}{fmt_price(prev_close)} | 현재가: {cur_sym}{fmt_price(current_price)}\n"
-            msg += f"새 목표 V: <b>${self.state.V:,.2f}</b>\nPool: ${allocated_pool:,.2f}"
+            msg += f"새 목표 V: <b>{cur_sym}{fmt_price(self.state.V)}</b>\nPool: {cur_sym}{fmt_price(allocated_pool)}"
             if self.config.use_db:
                 send_telegram_message(msg)
 
@@ -2074,16 +2130,28 @@ class ValueRebalancingEngine:
                 # 빌드업 완료 시점에 RUNNING 모드로 자동 전환
                 if self.state.bootstrap_day_count >= self.state.bootstrap_days:
                     self.state.mode = 'RUNNING'
-                    # 완료일 기준의 V값과 Pool을 동기화하여 실력공식 사이클 계산 시작
+                    # 완료일 기준의 V값과 Pool을 동기화하여 실력공식(Skill Formula) 사이클 계산 시작
                     E_end = (shares + qty_to_buy) * current_price
+                    ib = getattr(self.state, 'initial_budget', 0.0)
+                    V1 = ib if ib > 0 else self.state.V
                     G_coeff = self.config.G if self.config.G > 0 else 10.0
-                    new_V = (self.state.pool / G_coeff) + (E_end / (2.0 * math.sqrt(G_coeff)))
+                    term1 = self.state.pool / G_coeff
+                    term2 = (E_end - V1) / (2.0 * math.sqrt(G_coeff))
+                    p_accum = getattr(self.state, 'periodic_accumulation', 0.0)
+                    new_V = round(V1 + term1 + term2 + p_accum, 2)
                     
                     self.state.V = new_V
                     self.state.cycle_V = new_V
                     self.state.cycle_start_pool = self.state.pool
-                    logger.info(f"🎉 [Bootstrap Completed] {self.state.bootstrap_days}일의 초기 빌드업이 완료되었습니다! RUNNING 모드로 전환합니다. (목표 V: ${self.state.V:,.2f}, 잔여 Pool: ${self.state.pool:,.2f})")
-                    send_telegram_message(f"🎉 <b>[VR 빌드업 완료]</b> {symbol} 전략의 초기 빌드업({self.state.bootstrap_days}일)이 완료되어 RUNNING 모드로 자동 전환되었습니다!\n목표 V: ${self.state.V:,.2f}\n잔여 Pool: ${self.state.pool:,.2f}")
+                    
+                    cur_sym = "₩" if self.config.market == "KR" else "$"
+                    def fmt_val(v):
+                        if self.config.market == "KR": return f"{int(round(float(v))):,}"
+                        return f"{float(v):,.2f}"
+
+                    symbol_display = format_symbol_display(symbol, self.config.market)
+                    logger.info(f"🎉 [Bootstrap Completed] {self.state.bootstrap_days}일의 초기 빌드업이 완료되었습니다! RUNNING 모드로 전환합니다. (초기원금: {cur_sym}{fmt_val(V1)}, 목표 V2: {cur_sym}{fmt_val(self.state.V)}, 잔여 Pool: {cur_sym}{fmt_val(self.state.pool)})")
+                    send_telegram_message(f"🎉 <b>[VR 빌드업 완료]</b> {symbol_display} 전략의 초기 빌드업({self.state.bootstrap_days}일)이 완료되어 RUNNING 모드로 자동 전환되었습니다!\n초기원금(V1): {cur_sym}{fmt_val(V1)}\n새 목표 V: <b>{cur_sym}{fmt_val(self.state.V)}</b>\n잔여 Pool: {cur_sym}{fmt_val(self.state.pool)}")
                 
                 if self.config.use_db:
                     save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
@@ -2221,8 +2289,13 @@ class ValueRebalancingEngine:
                 logger.info("초기 매수(Bootstrap) 완료. 일반 리밸런싱 모드로 전환합니다.")
                 self.state.mode = 'RUNNING'
                 E_end = (shares + qty_to_buy) * exec_price
+                ib = getattr(self.state, 'initial_budget', 0.0)
+                V1 = ib if ib > 0 else self.state.V
                 G_coeff = self.config.G if self.config.G > 0 else 10.0
-                new_V = (self.state.pool / G_coeff) + (E_end / (2.0 * math.sqrt(G_coeff)))
+                term1 = self.state.pool / G_coeff
+                term2 = (E_end - V1) / (2.0 * math.sqrt(G_coeff))
+                p_accum = getattr(self.state, 'periodic_accumulation', 0.0)
+                new_V = V1 + term1 + term2 + p_accum
                 
                 self.state.V = new_V
                 self.state.cycle_V = new_V

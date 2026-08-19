@@ -524,5 +524,33 @@
 *   **단위 테스트 8종 작성 및 검증 완료**:
     - [test_reverse_mode.py](file:///d:/Python_D/kiwoom/test_reverse_mode.py): 진입 조건, 첫날 분기, 2회차 매수/매도, 지속성 보장, 종료 조건 회귀, 가드 로직, 한국 시장 첫날/2회차 모사 발주 등 총 8개 시나리오 단위 테스트를 작성하여 100% 통과(`OK`) 검증을 완료함.
 
+### 📅 2026-08-19 (장중 급락 매수 개장 러쉬 방지 가드 도입 및 멀티스레드 Race Condition 중복 발주 방어 완비)
+*   **개장 직후 틱 러쉬 방지 가드 (09:05 / 09:35) 도입**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py), [core/ws_client.py](file:///d:/Python_D/kiwoom/core/ws_client.py): 장 시작 직후(한국 09:00~09:05, 미국 09:30~09:35) 시세 및 호가 틱이 폭주하는 시간대 동안 변동성 과민 반응 및 중복 트리거를 방지하고자, 장중 급락 상태 감시 진입 시점을 한국 09:05, 미국 09:35 이후로 제한하는 개장 러쉬 방지 가드를 구축함.
+*   **스레드 락 진입 시 DB 최신 상태 동기화 및 덮어쓰기 방어**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `run_intraday_check`의 `_ca_intraday_lock` 진입 즉시 `load_state_db`로 최신 DB 상태를 리로드하여 이전 스냅샷 기반 날짜 초기화(`last_check_date != today_str`)의 중복 실행 버그와 상태 덮어쓰기 레이스 컨디션을 원천 차단함.
+*   **전역 활성 지연 타이머 핸들 관리(`_active_intraday_timers`)**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 종목/전략별로 실행 중인 `threading.Timer`를 딕셔너리로 추적하여 이미 지연 매수 대기 중인 타이머가 있을 경우 추가 중복 스케줄링을 원천 차단하고, 실행 완료/오류 시 안전하게 해제하도록 개선함.
+*   **단위 테스트 4종 작성 및 검증 완료**:
+    - [test_intraday_drop.py](file:///d:/Python_D/kiwoom/test_intraday_drop.py): 09:05 이전 러쉬 가드 차단, 09:05 이후 급락 매수 정상 발동, 10개 스레드 동시 틱 유입 시 타이머 단 1회 중복 방지 등록, 리버스 모드 가드 등 4개 시나리오 단위 테스트 100% 통과 검증.
+
+### 📅 2026-08-19 (VR 전략 Bootstrap 초기 밸류 V1 정상화 및 빌드업 완료 시 실력공식 V2 계산 보완)
+*   **VR 초기 생성 시 목표 밸류($V$) 원금 동기화**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 기존에 초기 $V$ 계산 시 $V_1=0$으로 시작하여 $V$가 $1/10$ 수준($898)으로 왜곡되던 오류를 수정하고, 초기 목표 밸류 $V$가 초기 투자 원금(`initial_budget`, $10,000)으로 온전히 시작되도록 바로잡음.
+*   **Bootstrap 10일차 완료 후 실력공식 $V_2$ 계산 전면 정상화**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): Bootstrap 빌드업 완료 시 $V_1 = \text{initial\_budget}$ ($10,000), 주식평가액 $E$, 가용 Pool, 기울기 $G$를 대입하여 정식 실력공식($V_2 = V_1 + \text{Pool}/G + \frac{E - V_1}{2\sqrt{G}} + \text{Contribution}$)으로 다음 목표 밸류($V_2 = \$9,265.91$)를 정확하게 산출하도록 개선함.
+*   **왜곡된 과거 상태 자가 치유(Self-Healing) 탑재**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): DB에 $898.72 등으로 왜곡 저장된 VR 상태를 엔진 로드 시 `initial_budget` 기준 실력공식으로 자동 재계산 및 자가 치유하여 정상 수치($9,265.91)로 복구 및 저장하도록 구현함.
+*   **대시보드 및 텔레그램 알림 미국 달러 소수점 2자리 정밀도 확보**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py), [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 미국장(US)의 모든 밸류($V$, $V_1$, $V_2$), 예수금(Pool), 주식 평가액($E$) 표기 시 정수 절삭 없이 소수점 둘째 자리(`float(v):,.2f`)까지 정밀하게 표기되도록 포맷팅 함수 및 텔레그램 메시지 생성부를 일원화함 (한국장은 원화 정수 표기 유지).
+*   **단위 테스트 3종 작성 및 검증 완료**:
+    - [test_vr_bootstrap_v.py](file:///d:/Python_D/kiwoom/test_vr_bootstrap_v.py): 초기 $V$ 원금 일치, 10일차 빌드업 완료 시 $V_2 = \$9,265.98$ 산출, 과거 왜곡 상태 자가 치유 등 3개 시나리오 100% 통과 검증.
+
+### 📅 2026-08-20 (타이핑 임포트 오류 수정 및 TQQQ VR 실전 DB 상태 목표 밸류 정상화 반영)
+*   **`typing.Dict` 임포트 누락 수정**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `_active_intraday_timers` 타입 어노테이션에 사용된 `Dict`가 상단 `typing` 임포트에서 누락되어 발생한 `NameError`를 `from typing import ..., Dict`로 즉시 수정하여 대시보드 및 코어 모듈 로딩 정상화.
+*   **TQQQ VR 실전 DB 상태 목표 밸류($V$) 마이그레이션**:
+    - DB에 보완 전 수치($898.72)로 남아있던 `TQQQ (VR-TQQQ-1호)` 전략의 상태를 실력공식 수식($V_1 = \$10,000$, $\text{Pool} = \$1,055.34$, $E = \$4,795.56$, $\text{Contribution} = \$250$)에 의해 정확히 재계산된 새 목표 밸류 **$V = \$9,532.64$** (밴드 범위: $8,102.74 ~ 10,962.54)로 즉시 갱신 및 커밋 완료함.
+
 
 

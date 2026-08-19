@@ -556,6 +556,11 @@ class KisWebSocketClient:
             # 상태 업데이트 및 장중 급락 점검
             target_states = get_all_states_db(symbol=symbol, market=self.market)
             
+            # [개장 러쉬 방지 가드] KR 09:05, US 09:35 이전에는 장중 급락 감시를 건너뜁니다.
+            now_dt = datetime.now(self.tz)
+            reg_open_check = dtime(9, 5) if self.market == "KR" else dtime(9, 35)
+            is_monitoring_window = now_dt.time() >= reg_open_check
+
             for state_data in target_states:
                 if not state_data.get('is_active', True): continue
                 
@@ -571,12 +576,21 @@ class KisWebSocketClient:
                 if stype == "CA":
                     config = CAConfig(symbol=symbol, use_db=True, market=self.market, strategy_name=alias)
                     engine = CostAveragingEngine(config, broker=self._broker)
-                    engine.run_intraday_check(current_price=current_price, prev_close=self._prev_close_cache.get(cache_key))
+                    if is_monitoring_window:
+                        engine.run_intraday_check(current_price=current_price, prev_close=self._prev_close_cache.get(cache_key))
                     target_state = engine.state
                 elif stype == "VR":
                     target_state = VRState(**state_data)
 
                 if should_save:
+                    # 최신 DB 상태를 다시 조회하여 current_price만 원자적으로 갱신
+                    latest_state_data = load_state_db(symbol, stype, market=self.market, strategy_name=alias)
+                    if latest_state_data:
+                        latest_state_data.pop('updated_at', None)
+                        if stype == "CA":
+                            target_state = CAState(**latest_state_data)
+                        elif stype == "VR":
+                            target_state = VRState(**latest_state_data)
                     target_state.current_price = current_price
                     save_state_db(target_state, market=self.market, strategy_name=alias, only_if_exists=True)
                     self._last_db_update[update_key] = now
