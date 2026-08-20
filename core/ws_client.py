@@ -15,7 +15,7 @@ import math
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.cavr import get_access_token, CAState, VRState, format_symbol_display, CAConfig, CostAveragingEngine
-from core.database import load_state_db, save_state_db, log_trade_db, delete_order_by_odno_db, get_all_states_db, get_config
+from core.database import load_state_db, save_state_db, log_trade_db, delete_order_by_odno_db, get_all_states_db, get_config, get_connection
 from core.notifier import send_telegram_message
 
 # Exponential backoff constants
@@ -110,6 +110,8 @@ class KisWebSocketClient:
         self._last_cache_date = None
         self.tz = pytz.timezone('Asia/Seoul' if self.market == "KR" else 'America/New_York')
         self._cache_lock = threading.Lock()
+        self._trade_lock = threading.Lock()
+        self._processed_cum_qty = {}
         self.is_subscribed_prices = False
 
     async def connect(self):
@@ -605,48 +607,106 @@ class KisWebSocketClient:
             values = item.get('values', {})
             
             # FID 파싱
-            odno = str(values.get('9203'))
-            status_text = values.get('913') # 접수, 체결, 취소 등
+            odno = str(values.get('9203') or '').strip()
+            status_text = str(values.get('913') or '').strip() # 접수, 체결, 취소 등
             
-            # 체결 단계일 때는 체결량(911)을 사용하고, 접수 등 비체결 단계일 때는 주문수량(900)을 사용
             cntg_div = "02" if "체결" in status_text else "01"
-            if cntg_div == "02":
-                exec_qty_str = values.get('911')
-            else:
-                exec_qty_str = values.get('900') or values.get('911')
-                
-            # 체결 단계일 때는 체결단가(910)를 사용하고, 접수 등 비체결 단계일 때는 주문단가(901)를 우선 사용
-            if cntg_div == "02":
-                exec_price_str = values.get('910') or values.get('901')
-            else:
-                exec_price_str = values.get('901') or values.get('910')
+            order_div_cd = str(values.get('906') or values.get('905') or values.get('50073') or "")
 
-            # 만약 여전히 가격이 0이거나 없다면 order_history DB에서 주문단가 조회
-            if (not exec_price_str or float(exec_price_str or 0) <= 0) and odno:
+            order_qty_raw = values.get('900')
+            unfilled_qty_raw = values.get('902')
+            cum_qty_raw = values.get('911')
+            unit_qty_raw = values.get('915') # 국내주식 단위체결량
+            unit_price_raw = values.get('914') # 국내주식 단위체결가
+            exec_price_raw = values.get('910') # 체결가
+            order_price_raw = values.get('901') # 주문단가
+
+            order_qty = int(float(order_qty_raw)) if order_qty_raw else None
+            unfilled_qty = int(float(unfilled_qty_raw)) if unfilled_qty_raw is not None and str(unfilled_qty_raw).strip() != '' else None
+            cum_qty = int(float(cum_qty_raw)) if cum_qty_raw else None
+            unit_qty = int(float(unit_qty_raw)) if unit_qty_raw else None
+
+            # 체결 단계(02) vs 접수 단계(01) 수량 산출
+            if cntg_div == "02":
+                with self._trade_lock:
+                    if unit_qty is not None and unit_qty > 0:
+                        exec_qty = unit_qty
+                        if cum_qty is not None and cum_qty > 0:
+                            self._processed_cum_qty[odno] = cum_qty
+                        else:
+                            self._processed_cum_qty[odno] = self._processed_cum_qty.get(odno, 0) + exec_qty
+                    elif cum_qty is not None and cum_qty > 0:
+                        prev_cum = self._processed_cum_qty.get(odno, 0)
+                        delta_qty = cum_qty - prev_cum
+                        if delta_qty <= 0:
+                            logger.debug(f"[WS] 이미 처리된 체결 수신 (중복 스킵): odno={odno}, cum_qty={cum_qty}, prev_cum={prev_cum}")
+                            return
+                        exec_qty = delta_qty
+                        self._processed_cum_qty[odno] = cum_qty
+                    else:
+                        exec_qty = int(float(order_qty_raw or 0))
+
+                    if len(self._processed_cum_qty) > 1000:
+                        old_keys = list(self._processed_cum_qty.keys())[:200]
+                        for k in old_keys:
+                            self._processed_cum_qty.pop(k, None)
+
+                # 미체결 및 전량체결 여부 판단
+                cur_cum_qty = self._processed_cum_qty.get(odno, exec_qty)
+                if unfilled_qty is not None:
+                    is_fully_filled = (unfilled_qty == 0)
+                elif order_qty is not None and order_qty > 0:
+                    is_fully_filled = (cur_cum_qty >= order_qty)
+                else:
+                    is_fully_filled = True
+
+                exec_price_str = unit_price_raw or exec_price_raw or order_price_raw
+            else: # 접수 (01)
+                exec_qty = order_qty if (order_qty and order_qty > 0) else int(float(cum_qty_raw or unit_qty_raw or 0))
+                is_fully_filled = False
+                cur_cum_qty = 0
+                exec_price_str = order_price_raw or exec_price_raw or unit_price_raw
+
+            # DB order_history에서 주문 시점의 정확한 정보(side, price, type 등) 교차 조회
+            db_side = None
+            if odno:
                 try:
                     from core.database import get_connection
                     conn_tmp = get_connection()
                     cur_tmp = conn_tmp.cursor()
-                    cur_tmp.execute("SELECT price FROM order_history WHERE odno=?", (odno,))
-                    row_p = cur_tmp.fetchone()
-                    if row_p and row_p[0] and float(row_p[0]) > 0:
-                        exec_price_str = str(row_p[0])
+                    cur_tmp.execute("SELECT side, price, type FROM order_history WHERE odno=?", (odno,))
+                    row_db = cur_tmp.fetchone()
+                    if row_db:
+                        if row_db[0]:
+                            db_side = str(row_db[0]).strip().upper()
+                        if (not exec_price_str or float(exec_price_str or 0) <= 0) and row_db[1] and float(row_db[1]) > 0:
+                            exec_price_str = str(row_db[1])
+                        if not order_div_cd and row_db[2]:
+                            order_div_cd = str(row_db[2])
                     conn_tmp.close()
                 except Exception:
                     pass
 
-            side_raw = values.get('907') # 1:매도, 2:매수
+            # 매도수 구분 파싱 (FID 907, FID 50072, FID 50073, FID 906 및 DB 매핑 종합 판정)
+            side_raw = str(values.get('907') or '').strip().upper()
+            side_name_raw = str(values.get('50072') or values.get('50073') or values.get('906') or '').strip().upper()
             exec_time = values.get('908') # HHmmss
-            order_div_cd = str(values.get('906') or "") # 매매구분명 또는 코드
             
-            if not exec_qty_str:
+            if db_side in ["SELL", "BUY"]:
+                order_type = db_side
+            elif side_raw in ["1", "01", "SELL", "매도"] or side_name_raw in ["1", "01", "SELL", "매도"] or "매도" in side_name_raw:
+                order_type = "SELL"
+            elif side_raw in ["2", "02", "BUY", "매수"] or side_name_raw in ["2", "02", "BUY", "매수"] or "매수" in side_name_raw:
+                order_type = "BUY"
+            else:
+                order_type = "SELL" if (side_raw == "1" or "매도" in side_raw or "매도" in side_name_raw) else "BUY"
+            
+            if not exec_qty or exec_qty <= 0:
                 return
                 
-            exec_qty = int(float(exec_qty_str))
             exec_price = float(exec_price_str or 0.0)
-            order_type = "SELL" if side_raw == "1" else "BUY"
 
-            logger.debug(f"[WS] {self.market} Parsed Fields: odno={odno}, order_type={order_type}, symbol={symbol}, exec_qty={exec_qty}, exec_price={exec_price}, status={status_text}")
+            logger.debug(f"[WS] {self.market} Parsed Fields: odno={odno}, order_type={order_type}, symbol={symbol}, exec_qty={exec_qty}, exec_price={exec_price}, status={status_text}, fully_filled={is_fully_filled}")
 
             is_buy = (order_type == "BUY")
             side_icon = "🔵" if is_buy else "🔴"
@@ -657,17 +717,6 @@ class KisWebSocketClient:
             # 체결 수량이 없는 접수 단계 등은 알림만 하고 리턴 (US)
             if self.market == "US" and cntg_div == "02" and (exec_qty <= 0 or exec_price <= 0):
                 return
-
-            # DB에서 주문 유형 정보 보완
-            if not order_div_cd:
-                from core.database import get_connection
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT type FROM order_history WHERE odno=?", (odno,))
-                db_res = cursor.fetchone()
-                if db_res:
-                    order_div_cd = db_res[0]
-                conn.close()
 
             cur_sym = "₩" if self.market == "KR" else "$"
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -682,8 +731,17 @@ class KisWebSocketClient:
             
             order_type_display = ORDER_TYPE_MAP.get(order_div_cd, order_div_cd)
 
+            # 분할 체결 안내 부가정보
+            fill_desc = ""
+            if cntg_div == "02":
+                if not is_fully_filled:
+                    unfilled_str = f", 잔여: {unfilled_qty}주" if unfilled_qty is not None else ""
+                    fill_desc = f" (분할: {exec_qty}주 / 누적: {cur_cum_qty}주{unfilled_str})"
+                elif cur_cum_qty > exec_qty:
+                    fill_desc = f" (최종: {exec_qty}주 / 총: {cur_cum_qty}주 전량 완료)"
+
             # 로그 기록 및 텔레그램 전송
-            log_msg = f"[WS {log_prefix}] [{self.market}] {symbol_display} {side_name} {log_prefix} ({order_type_display})! {exec_qty}주 @ {cur_sym}{price_fmt} ({exec_time})"
+            log_msg = f"[WS {log_prefix}] [{self.market}] {symbol_display} {side_name} {log_prefix} ({order_type_display})! {exec_qty}주 @ {cur_sym}{price_fmt} ({exec_time}){fill_desc}"
             logger.info(log_msg)
             
             tg_msg = (
@@ -691,7 +749,7 @@ class KisWebSocketClient:
                 f"일시: {formatted_exec_time}\n"
                 f"종목: <b>{symbol_display}</b>\n"
                 f"구분: {side_name}\n"
-                f"수량: {exec_qty}주\n"
+                f"수량: {exec_qty}주{fill_desc}\n"
                 f"가격: {cur_sym}{price_fmt}"
             )
             if order_type_display:
@@ -700,172 +758,215 @@ class KisWebSocketClient:
             
             # 실제 체결 완료 시 잔고/상태 및 DB 업데이트
             if cntg_div == "02":
-                self.process_trade_update(symbol, order_type, exec_price, exec_qty, formatted_exec_time, odno=odno)
+                self.process_trade_update(symbol, order_type, exec_price, exec_qty, formatted_exec_time, odno=odno, is_fully_filled=is_fully_filled)
 
         except Exception as e:
             logger.error(f"[WS] 데이터 파싱 오류: {e} | 아이템: {item}")
 
-    def process_trade_update(self, symbol, order_type, price, qty, time_str, odno=None):
-        """체결 정보를 바탕으로 DB 업데이트 (KIS 로직 완전 계승)"""
-        if odno:
-            delete_order_by_odno_db(odno)
+    def process_trade_update(self, symbol, order_type, price, qty, time_str, odno=None, is_fully_filled=True):
+        """체결 정보를 바탕으로 DB 업데이트 (동시성 락 적용)"""
+        if qty <= 0:
+            return
 
-        from core.database import get_connection, load_state_db
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT strategy, strategy_name FROM order_history WHERE odno=?", (odno,))
-        order_info = cursor.fetchone()
-
-        # 잔고 조회
-        equity_res = self._broker.get_account_equity(symbol)
-        real_avg_price = 0.0
-        if equity_res and equity_res[1] is not None:
-            real_avg_price = equity_res[1]
-        
-        avg_price_for_profit = real_avg_price
-        realized_profit = 0.0
-        realized_profit_rate = 0.0
-
-        if order_info:
-            target_strategy_type = order_info[0]
-            target_strategy_alias = order_info[1]
-            strategy_found_for_log = target_strategy_type
-        elif symbol:
-            cursor.execute("SELECT strategy, strategy_name FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND market=? AND is_active=1 LIMIT 1", (symbol, f"{symbol} %", self.market))
-            fallback_info = cursor.fetchone()
-            if fallback_info:
-                target_strategy_type, target_strategy_alias = fallback_info
-                strategy_found_for_log = target_strategy_type
-            else:
-                target_strategy_type, target_strategy_alias, strategy_found_for_log = None, None, "MANUAL"
-        
-        conn.close()
-
-        if target_strategy_type and target_strategy_alias:
-            state_data = load_state_db(symbol, target_strategy_type, market=self.market, strategy_name=target_strategy_alias)
-            
-            if state_data:
-                if avg_price_for_profit <= 0:
-                    avg_price_for_profit = float(state_data.get('avg_price', 0.0))
-                
-                if avg_price_for_profit <= 0:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        SELECT avg_price FROM trade_history 
-                        WHERE symbol=? AND market=? AND strategy_name=? AND avg_price > 0 
-                        ORDER BY date DESC, id DESC LIMIT 1
-                    ''', (symbol, self.market, target_strategy_alias))
-                    row_th = cursor.fetchone()
-                    if row_th:
-                        avg_price_for_profit = row_th[0]
-                    conn.close()
-
-                try:
-                    if target_strategy_type == "VR":
-                        vr_state = VRState(**state_data)
-                        current_pool = float(vr_state.pool)
-                        trade_amt = price * qty
-                        
-                        if order_type == "BUY":
-                            vr_state.pool = current_pool - trade_amt
-                        elif order_type == "SELL":
-                            vr_state.pool = current_pool + trade_amt
-                        
-                        save_state_db(vr_state, market=self.market, strategy_name=vr_state.strategy_name)
-                        cur_sym = "₩" if self.market == "KR" else "$"
-                        symbol_display = format_symbol_display(symbol, self.market)
-                        msg = f"💰 [{self.market} VR 잔고 보고] {symbol_display} ({vr_state.strategy_name})\nPool: {cur_sym}{current_pool:,.2f} -> <b>{cur_sym}{vr_state.pool:,.2f}</b>"
-                        logger.info(msg.replace('\n', ' '))
-                        send_telegram_message(msg)
-                        
-                    elif target_strategy_type == "CA":
-                        ca_state = CAState(**state_data)
-                        current_shares = float(ca_state.total_shares)
-                        current_avg = float(ca_state.avg_price)
-                        trade_amt = price * qty
-                        
-                        if order_type == "BUY":
-                            new_shares = current_shares + qty
-                            if new_shares > 0:
-                                new_avg = ((current_shares * current_avg) + (qty * price)) / new_shares
-                            else:
-                                new_avg = price
-                            
-                            ca_state.total_shares = new_shares
-                            ca_state.avg_price = new_avg
-                            ca_state.last_execution_price = price
-                            
-                            unit_buy = float(ca_state.unit_buy_amount)
-                            if unit_buy > 0:
-                                invested = new_shares * new_avg
-                                ca_state.current_turn = math.ceil((invested / unit_buy) * 10) / 10.0
-                            
-                        elif order_type == "SELL":
-                            new_shares = max(0, current_shares - qty)
-                            ca_state.total_shares = new_shares
-                            
-                            if new_shares == 0:
-                                ca_state.pending_cycle_transition = True
-                                logger.info(f"🚩 [WS] {symbol} 전량 매도 확인. 다음 날 장 시작 시 차수 전환이 진행됩니다.")
-                        
-                        save_state_db(ca_state, market=self.market, strategy_name=ca_state.strategy_name)
-                        symbol_display = format_symbol_display(symbol, self.market)
-                        logger.info(f"[WS] CA 잔고 및 상태 업데이트 완료: {symbol_display} ({ca_state.strategy_name}) (T: {ca_state.current_turn})")
-                except Exception as e:
-                    logger.error(f"[WS] {target_strategy_type} 상태 업데이트 실패: {e}")
-
-        # 수수료 및 세금 산출
-        fee_rate = float(os.getenv("fee_rate", "0.00015" if self.market == "KR" else "0.0007"))
-        tax_rate = float(os.getenv("tax_sell", "0.0020" if self.market == "KR" else "0.0000206"))
-
-        fee_val = 0.0
-        tax_val = 0.0
-        principal = price * qty
-        if order_type == "SELL":
-            fee_val = round(principal * fee_rate, 2)
-            tax_val = round(principal * tax_rate, 2)
-            total_amt = principal - fee_val - tax_val
-            
-            if avg_price_for_profit > 0:
-                cost_basis = avg_price_for_profit * qty * (1 + fee_rate)
-                realized_profit = total_amt - cost_basis
-                if cost_basis > 0:
-                    realized_profit_rate = (realized_profit / cost_basis) * 100
-        else:
-            fee_val = round(principal * fee_rate, 2)
-            total_amt = principal + fee_val
-
-        try:
+        with self._trade_lock:
+            from core.database import get_connection, load_state_db
             conn = get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT SUM(total_amount) FROM trade_history WHERE strategy_name=? AND symbol=? AND market=? AND side='BUY'", (target_strategy_alias, symbol, self.market))
-            c_buy = (cursor.fetchone()[0] or 0.0) + (total_amt if order_type == "BUY" else 0.0)
-            cursor.execute("SELECT SUM(total_amount) FROM trade_history WHERE strategy_name=? AND symbol=? AND market=? AND side='SELL'", (target_strategy_alias, symbol, self.market))
-            c_sell = (cursor.fetchone()[0] or 0.0) + (total_amt if order_type == "SELL" else 0.0)
+            cursor.execute("SELECT strategy, strategy_name, side FROM order_history WHERE odno=?", (odno,))
+            order_info = cursor.fetchone()
+
+            if order_info and order_info[2]:
+                order_type = str(order_info[2]).strip().upper()
+
+            if odno and is_fully_filled:
+                delete_order_by_odno_db(odno)
+
+            # 잔고 조회
+            equity_res = self._broker.get_account_equity(symbol)
+            real_avg_price = 0.0
+            if equity_res and equity_res[1] is not None:
+                real_avg_price = equity_res[1]
+            
+            avg_price_for_profit = real_avg_price
+            realized_profit = 0.0
+            realized_profit_rate = 0.0
+
+            # 전략 및 별칭 식별 (다층 탐색)
+            target_strategy_type = None
+            target_strategy_alias = None
+            strategy_found_for_log = "MANUAL"
+
+            if order_info and order_info[0]:
+                target_strategy_type = order_info[0]
+                target_strategy_alias = order_info[1]
+                strategy_found_for_log = target_strategy_type
+            elif odno:
+                cursor.execute("SELECT strategy, strategy_name FROM trade_history WHERE odno=? AND market=? LIMIT 1", (odno, self.market))
+                th_info = cursor.fetchone()
+                if th_info and th_info[0]:
+                    target_strategy_type, target_strategy_alias = th_info
+                    strategy_found_for_log = target_strategy_type
+
+            if not target_strategy_type or not target_strategy_alias:
+                cursor.execute('''
+                    SELECT strategy, strategy_name FROM trade_history 
+                    WHERE (symbol=? OR symbol LIKE ?) AND market=? AND strategy_name IS NOT NULL AND strategy_name != ''
+                    ORDER BY date DESC, id DESC LIMIT 1
+                ''', (symbol, f"{symbol} %", self.market))
+                th_recent = cursor.fetchone()
+                if th_recent and th_recent[0]:
+                    target_strategy_type, target_strategy_alias = th_recent
+                    strategy_found_for_log = target_strategy_type
+
+            if not target_strategy_type or not target_strategy_alias:
+                cursor.execute("SELECT strategy, strategy_name FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND market=? AND is_active=1 LIMIT 1", (symbol, f"{symbol} %", self.market))
+                fallback_info = cursor.fetchone()
+                if fallback_info:
+                    target_strategy_type, target_strategy_alias = fallback_info
+                    strategy_found_for_log = target_strategy_type
+
+            # 평단가 탐색 (브로커 원장 -> 상태 DB -> 최근 거래내역 -> 체결가 폴백)
+            if avg_price_for_profit <= 0 and target_strategy_type and target_strategy_alias:
+                state_data_tmp = load_state_db(symbol, target_strategy_type, market=self.market, strategy_name=target_strategy_alias)
+                if state_data_tmp:
+                    avg_price_for_profit = float(state_data_tmp.get('avg_price', 0.0))
+
+            if avg_price_for_profit <= 0:
+                cursor.execute('''
+                    SELECT avg_price FROM trade_history 
+                    WHERE symbol=? AND market=? AND avg_price > 0 
+                    ORDER BY date DESC, id DESC LIMIT 1
+                ''', (symbol, self.market))
+                row_th = cursor.fetchone()
+                if row_th and row_th[0] and float(row_th[0]) > 0:
+                    avg_price_for_profit = float(row_th[0])
+
+            if avg_price_for_profit <= 0:
+                avg_price_for_profit = price
+
             conn.close()
 
-            trade_date = time_str if (time_str and '-' in str(time_str)) else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if target_strategy_type and target_strategy_alias:
+                state_data = load_state_db(symbol, target_strategy_type, market=self.market, strategy_name=target_strategy_alias)
+                
+                if state_data:
+                    try:
+                        if target_strategy_type == "VR":
+                            vr_state = VRState(**state_data)
+                            current_pool = float(vr_state.pool)
+                            current_shares = float(getattr(vr_state, 'total_shares', 0.0))
+                            current_avg = float(getattr(vr_state, 'avg_price', 0.0))
+                            trade_amt = price * qty
+                            
+                            if order_type == "BUY":
+                                vr_state.pool = current_pool - trade_amt
+                                new_shares = current_shares + qty
+                                if new_shares > 0:
+                                    new_avg = ((current_shares * current_avg) + (qty * price)) / new_shares if current_avg > 0 else price
+                                else:
+                                    new_avg = price
+                                vr_state.total_shares = new_shares
+                                vr_state.avg_price = new_avg
+                                avg_price_for_profit = new_avg
+                            elif order_type == "SELL":
+                                vr_state.pool = current_pool + trade_amt
+                                vr_state.total_shares = max(0.0, current_shares - qty)
+                            
+                            save_state_db(vr_state, market=self.market, strategy_name=vr_state.strategy_name)
+                            cur_sym = "₩" if self.market == "KR" else "$"
+                            symbol_display = format_symbol_display(symbol, self.market)
+                            msg = f"💰 [{self.market} VR 잔고 보고] {symbol_display} ({vr_state.strategy_name})\nPool: {cur_sym}{current_pool:,.2f} -> <b>{cur_sym}{vr_state.pool:,.2f}</b>"
+                            logger.info(msg.replace('\n', ' '))
+                            send_telegram_message(msg)
+                            
+                        elif target_strategy_type == "CA":
+                            ca_state = CAState(**state_data)
+                            current_shares = float(ca_state.total_shares)
+                            current_avg = float(ca_state.avg_price)
+                            trade_amt = price * qty
+                            
+                            if order_type == "BUY":
+                                new_shares = current_shares + qty
+                                if new_shares > 0:
+                                    new_avg = ((current_shares * current_avg) + (qty * price)) / new_shares if current_avg > 0 else price
+                                else:
+                                    new_avg = price
+                                
+                                ca_state.total_shares = new_shares
+                                ca_state.avg_price = new_avg
+                                ca_state.last_execution_price = price
+                                avg_price_for_profit = new_avg
+                                
+                                unit_buy = float(ca_state.unit_buy_amount)
+                                if unit_buy > 0:
+                                    invested = new_shares * new_avg
+                                    ca_state.current_turn = math.ceil((invested / unit_buy) * 10) / 10.0
+                                
+                            elif order_type == "SELL":
+                                new_shares = max(0.0, current_shares - qty)
+                                ca_state.total_shares = new_shares
+                                
+                                if new_shares == 0:
+                                    ca_state.pending_cycle_transition = True
+                                    logger.info(f"🚩 [WS] {symbol} 전량 매도 확인. 다음 날 장 시작 시 차수 전환이 진행됩니다.")
+                            
+                            save_state_db(ca_state, market=self.market, strategy_name=ca_state.strategy_name)
+                            symbol_display = format_symbol_display(symbol, self.market)
+                            logger.info(f"[WS] CA 잔고 및 상태 업데이트 완료: {symbol_display} ({ca_state.strategy_name}) (T: {ca_state.current_turn})")
+                    except Exception as e:
+                        logger.error(f"[WS] {target_strategy_type} 상태 업데이트 실패: {e}")
 
-            log_trade_db(
-                date=trade_date,
-                symbol=symbol,
-                strategy=strategy_found_for_log,
-                side=order_type,
-                price=price,
-                qty=qty,
-                fee=fee_val,
-                total_amount=total_amt,
-                turn=0.0,
-                note=f"Synced (ODNO: {odno})",
-                odno=odno, 
-                market=self.market,
-                strategy_name=target_strategy_alias,
-                avg_price=avg_price_for_profit,
-                realized_profit=realized_profit,
-                realized_profit_rate=realized_profit_rate,
-                cum_buy_amt=c_buy,
-                cum_sell_amt=c_sell
-            )
-        except Exception as e:
-            logger.error(f"[WS] 거래 내역 저장 실패: {e}")
+            # 수수료 및 세금 산출
+            fee_rate = float(os.getenv("fee_rate", "0.00015" if self.market == "KR" else "0.0007"))
+            tax_rate = float(os.getenv("tax_sell", "0.0020" if self.market == "KR" else "0.0000206"))
+
+            fee_val = 0.0
+            tax_val = 0.0
+            principal = price * qty
+            if order_type == "SELL":
+                fee_val = round(principal * fee_rate, 2)
+                tax_val = round(principal * tax_rate, 2)
+                total_amt = principal - fee_val - tax_val
+                
+                if avg_price_for_profit > 0:
+                    cost_basis = avg_price_for_profit * qty * (1 + fee_rate)
+                    realized_profit = total_amt - cost_basis
+                    if cost_basis > 0:
+                        realized_profit_rate = (realized_profit / cost_basis) * 100
+            else:
+                fee_val = round(principal * fee_rate, 2)
+                total_amt = principal + fee_val
+
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT SUM(total_amount) FROM trade_history WHERE strategy_name=? AND symbol=? AND market=? AND side='BUY'", (target_strategy_alias, symbol, self.market))
+                c_buy = (cursor.fetchone()[0] or 0.0) + (total_amt if order_type == "BUY" else 0.0)
+                cursor.execute("SELECT SUM(total_amount) FROM trade_history WHERE strategy_name=? AND symbol=? AND market=? AND side='SELL'", (target_strategy_alias, symbol, self.market))
+                c_sell = (cursor.fetchone()[0] or 0.0) + (total_amt if order_type == "SELL" else 0.0)
+                conn.close()
+
+                trade_date = time_str if (time_str and '-' in str(time_str)) else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                log_trade_db(
+                    date=trade_date,
+                    symbol=symbol,
+                    strategy=strategy_found_for_log,
+                    side=order_type,
+                    price=price,
+                    qty=qty,
+                    fee=fee_val,
+                    total_amount=total_amt,
+                    turn=0.0,
+                    note=f"Synced (ODNO: {odno})",
+                    odno=odno, 
+                    market=self.market,
+                    strategy_name=target_strategy_alias,
+                    avg_price=avg_price_for_profit,
+                    realized_profit=realized_profit,
+                    realized_profit_rate=realized_profit_rate,
+                    cum_buy_amt=c_buy,
+                    cum_sell_amt=c_sell
+                )
+            except Exception as e:
+                logger.error(f"[WS] 거래 내역 저장 실패: {e}")

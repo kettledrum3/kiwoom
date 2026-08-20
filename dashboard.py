@@ -1373,10 +1373,14 @@ def render_market_tab(m_code):
                 status_label = "운영 중" if is_active else "일시 정지됨"
                 st.write(f"상태: {status_icon} **{status_label}**{ver_text}")
 
-                cur_sym = "₩" if m_code == "KR" else "$"
+                cur_sym = "₩" if m_code == "KR" else "\\$"
                 if stype == "CA":
-                    st.write(f"T: **{s.get('current_turn', 0):.1f}** / 평단: {cur_sym}{format_currency(s.get('avg_price', 0), m_code)} / 보유: {s.get('total_shares', 0)}주")
-                    st.write(f"할당 예수금: {cur_sym}{format_currency(s.get('pool', 0), m_code)} / 분할수: {s.get('a_default', 40)} / 1회매수금: {cur_sym}{format_currency(s.get('unit_buy_amount', 0), m_code)} / 목표수익률: {s.get('target_profit_pct', 0.1)*100:.1f}%")
+                    st.markdown(
+                        f"T: **{s.get('current_turn', 0):.1f}** / 평단: **{cur_sym}{format_currency(s.get('avg_price', 0), m_code)}** / 보유: **{s.get('total_shares', 0)}주**"
+                    )
+                    st.markdown(
+                        f"할당 예수금: **{cur_sym}{format_currency(s.get('pool', 0), m_code)}** / 분할수: **{s.get('a_default', 40)}** / 1회매수금: **{cur_sym}{format_currency(s.get('unit_buy_amount', 0), m_code)}** / 목표수익률: **{s.get('target_profit_pct', 0.1)*100:.1f}%**"
+                    )
                 else:
                     initial_budget_val = s.get('initial_budget', 0.0)
                     cycle_V_val = s.get('cycle_V', 0.0)
@@ -1386,8 +1390,15 @@ def render_market_tab(m_code):
                     if pool_val == 0.0 and initial_budget_val > 0:
                         pool_val = initial_budget_val
                     band_pct = s.get('band_high_pct', 115.0) - 100.0
-                    st.write(f"목표V: {cur_sym}{format_currency(cycle_V_val, m_code)} / Pool: {cur_sym}{format_currency(pool_val, m_code)}")
-                    st.write(f"운용 자본금: {cur_sym}{format_currency(initial_budget_val, m_code)} / G값: {s.get('G', 10)} / 밴드: {band_pct:.0f}% / 적립액: {cur_sym}{format_currency(s.get('periodic_accumulation', 0), m_code)}")
+                    freq_val = s.get('freq', '격주 금요일 (2주)')
+                    pool_limit_val = float(s.get('pool_limit_pct', 50.0))
+                    accum_amt = s.get('periodic_accumulation', 0.0)
+                    st.markdown(
+                        f"목표V: **{cur_sym}{format_currency(cycle_V_val, m_code)}** / Pool: **{cur_sym}{format_currency(pool_val, m_code)}** / 풀 한도: **{pool_limit_val:.0f}%**"
+                    )
+                    st.markdown(
+                        f"운용 자본금: **{cur_sym}{format_currency(initial_budget_val, m_code)}** / G값: **{s.get('G', 10)}** / 밴드: **{band_pct:.0f}%** / 주기: **{freq_val}** / 적립액: **{cur_sym}{format_currency(accum_amt, m_code)}**"
+                    )
 
                 # [ADD] 전략 선택 버튼 (사이드바 연동)
                 if st.button("🎯 이 전략을 작업 대상으로 선택", key=f"sel_target_{m_code}_{stype}_{sym}_{disp_name}", width='stretch', type="primary"):
@@ -1916,9 +1927,9 @@ def display_realtime_header():
                     fx_time = get_config("USDKRW_UPDATE_TIME", "N/A")
                     col1, col2, col3, col4 = st.columns([1.5, 1.5, 1, 2])
                     col1.metric(label=f"현재가 ({format_ticker_display(symbol, market_code)})", value=f"{currency_symbol}{format_currency(price, market_code)}", delta=delta_val)
-                    col2.metric(label="현재 환율 (USD/KRW)", value=f"₩{usd_krw:,.2f}", delta=delta_fx)
+                    col2.metric(label="환율 (정규장 개장 09:30 ET 기준)", value=f"₩{usd_krw:,.2f}", delta=delta_fx)
                     with col2:
-                        st.caption(f"업데이트: {fx_time}")
+                        st.caption(f"기준: 전일 개장 대비 | {fx_time}")
                         if st.button("🔄 지금 환율 조회", key="manual_fx_update", help="환율 정보를 즉시 갱신합니다."):
                             job_update_exchange_rate(broker=ActiveBroker, force=True)
                             st.rerun()

@@ -296,9 +296,9 @@ def job_market_prepare(market: str = "US"):
         start_date = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
         end_date = datetime.now().strftime("%Y%m%d")
         
-        # [ADD] 미국 시장 준비 시 환율 정보 업데이트
+        # [ADD] 미국 시장 준비 시 개장 기준 환율 정보 업데이트
         if market == "US":
-            job_update_exchange_rate(broker)
+            job_update_exchange_rate(broker, is_market_open=True)
 
         for st in get_all_states_db(market=market):
             execs = broker.fetch_execution_history(st['symbol'], start_date, end_date)
@@ -312,15 +312,16 @@ def job_market_prepare(market: str = "US"):
     except Exception as e:
         logger.error(f"[{market}] Job Market Prepare Failed: {e}")
 
-def job_update_exchange_rate(broker=None, force=False, is_post_market=False):
-    """키움증권 US 브로커(ust31301)를 사용하여 고시 환율을 조회하고 DB에 저장"""
+def job_update_exchange_rate(broker=None, force=False, is_market_open=False):
+    """키움증권 US 브로커(ust31301)를 사용하여 고시 환율을 조회하고 DB에 저장
+    
+    기준: 미국 정규장 시작 시간(09:30 ET)의 환율을 기준으로 하며,
+          전날 기준 환율도 전날 미국 정규장 시작 시간의 환율로 비교합니다.
+    """
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
-        cache_key = f"USDKRW_UPDATE_DATE_{'POST' if is_post_market else 'PRE'}"
-        last_update_date = get_config(cache_key, "")
-        if not force and last_update_date == today_str:
-            logger.info(f"💵 [ExchangeRate] 오늘({'장 마감 후' if is_post_market else '장 시작 전'}) 환율 업데이트가 이미 완료되었습니다.")
-            return
+        cache_key = "USDKRW_MARKET_OPEN_DATE"
+        last_open_date = get_config(cache_key, "")
 
         if not broker:
             from core.brokers.kiwoom_us import KiwoomUsBroker
@@ -330,12 +331,25 @@ def job_update_exchange_rate(broker=None, force=False, is_post_market=False):
         rate = rate_info.get("rate", 0.0)
 
         if rate > 0:
-            # 전날 장 마감 환율을 기준 환율(base_rate)로 보존하여 변동폭 계산
+            # 미국 정규장 개장(09:30 ET) 환율 업데이트 시:
+            # 기존 USDKRW_OPEN_RATE(전일 개장 환율)를 USDKRW_BASE_RATE로 보존하고 오늘 개장 환율을 저장
+            if is_market_open:
+                prev_open_rate_str = get_config("USDKRW_OPEN_RATE", "")
+                if prev_open_rate_str:
+                    set_config("USDKRW_BASE_RATE", prev_open_rate_str)
+                else:
+                    curr_base = get_config("USDKRW_BASE_RATE", "")
+                    if not curr_base:
+                        set_config("USDKRW_BASE_RATE", f"{rate:.2f}")
+                
+                set_config("USDKRW_OPEN_RATE", f"{rate:.2f}")
+                set_config(cache_key, today_str)
+
             base_rate_str = get_config("USDKRW_BASE_RATE", "")
             if not base_rate_str:
-                base_rate_str = get_config("USDKRW", f"{rate:.2f}")
+                base_rate_str = get_config("USDKRW_OPEN_RATE", f"{rate:.2f}")
                 set_config("USDKRW_BASE_RATE", base_rate_str)
-            
+
             try:
                 base_rate = float(base_rate_str)
             except ValueError:
@@ -350,23 +364,21 @@ def job_update_exchange_rate(broker=None, force=False, is_post_market=False):
 
             set_config("USDKRW", f"{rate:.2f}")
             set_config("USDKRW_UPDATE_DATE", today_str)
-            set_config(cache_key, today_str)
             set_config("USDKRW_UPDATE_TIME", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             
             set_config("USDKRW_DIFF", f"{diff:.2f}")
             set_config("USDKRW_PCT", f"{pct:.2f}")
             
-            if is_post_market:
-                set_config("USDKRW_BASE_RATE", f"{rate:.2f}")
-                logger.info(f"💵 [ExchangeRate] 장 마감 후 기준 고시환율 갱신 완료: 1$ = ₩{rate:,.2f}")
+            label_desc = "미국 정규장 개장 기준 (09:30 ET)" if is_market_open else "실시간 환율 조회"
+            logger.info(f"💵 [ExchangeRate] 키움 환율 업데이트 완료: 1$ = ₩{rate:,.2f} (전일 개장 기준: ₩{base_rate:,.2f}, 전일대비 {diff:+.2f}원, {pct:+.2f}%)")
             
-            logger.info(f"💵 [ExchangeRate] 키움 고시환율 업데이트 완료: 1$ = ₩{rate:,.2f} (기준 환율: ₩{base_rate:,.2f}, 전일대비 {diff:+.2f}원, {pct:+.2f}%)")
-            send_telegram_message(
-                f"💵 <b>[고시환율 업데이트 완료]</b>\n"
-                f"구분: {'장 마감 후 (기준 환율 갱신)' if is_post_market else '장 시작 전'}\n"
-                f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"고시 환율: 1$ = <b>₩{rate:,.2f}</b> (전일대비 {diff:+.2f}원, {pct:+.2f}%)"
-            )
+            if is_market_open or force:
+                send_telegram_message(
+                    f"💵 <b>[고시환율 업데이트 완료]</b>\n"
+                    f"구분: {label_desc}\n"
+                    f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"고시 환율: 1$ = <b>₩{rate:,.2f}</b> (전일 개장대비 {diff:+.2f}원, {pct:+.2f}%)"
+                )
         else:
             logger.warning("⚠️ [ExchangeRate] 키움 환율 API 응답에서 고시환율을 가져오지 못했습니다.")
     except Exception as e:
@@ -792,13 +804,13 @@ def main():
     # --- 준비 작업 (개장 3분 후) ---
     scheduler.add_job(
         lambda: job_market_prepare(market="US"),
-        trigger=CronTrigger(hour=9, minute=35, day_of_week='mon-fri', timezone=ny_tz), # 09:30 개장 5분 후
+        trigger=CronTrigger(hour=9, minute=33, day_of_week='mon-fri', timezone=ny_tz), # 09:30 개장 3분 후
         id='us_market_prepare',
         name='미국장 차수 전환 준비'
     )
     scheduler.add_job(
         lambda: job_market_prepare(market="KR"),
-        trigger=CronTrigger(hour=9, minute=5, day_of_week='mon-fri', timezone=kr_tz), # 09:00 개장 5분 후
+        trigger=CronTrigger(hour=9, minute=3, day_of_week='mon-fri', timezone=kr_tz), # 09:00 개장 3분 후
         id='kr_market_prepare', 
         name='한국장 차수 전환 준비'
     )
@@ -820,7 +832,7 @@ def main():
     # 2. 한국 시장 스케줄
     scheduler.add_job(
         lambda: job_market_open(market="KR"),
-        trigger=CronTrigger(hour=9, minute=10, day_of_week='mon-fri', timezone=kr_tz), # 09:00 개장 10분 후
+        trigger=CronTrigger(hour=9, minute=5, day_of_week='mon-fri', timezone=kr_tz), # 09:00 개장 5분 후
         id='kr_market_open',
         name='한국장 개장 후 주문'
     )
@@ -882,20 +894,12 @@ def main():
         name='Heartbeat'
     )
 
-    # 환율 정보 업데이트: 미국 장 시작 2시간 전 (07:30 ET)
+    # 환율 정보 업데이트: 미국 정규장 시작 시각 (09:30 ET) - 전일 개장 환율을 기준 환율로 설정하고 당일 개장 환율 확정
     scheduler.add_job(
-        lambda: job_update_exchange_rate(is_post_market=False),
-        trigger=CronTrigger(hour=7, minute=30, day_of_week='mon-fri', timezone=ny_tz),
-        id='us_pre_market_exchange_rate',
-        name='Exchange Rate Update (Pre-Market 07:30 ET)'
-    )
-
-    # 환율 정보 업데이트: 미국 장 마감 직후 (16:05 ET) - 오늘의 종가 환율을 다음날의 기준 환율로 지정
-    scheduler.add_job(
-        lambda: job_update_exchange_rate(is_post_market=True),
-        trigger=CronTrigger(hour=16, minute=5, day_of_week='mon-fri', timezone=ny_tz),
-        id='us_post_market_exchange_rate',
-        name='Exchange Rate Update (Post-Market 16:05 ET)'
+        lambda: job_update_exchange_rate(is_market_open=True),
+        trigger=CronTrigger(hour=9, minute=30, day_of_week='mon-fri', timezone=ny_tz),
+        id='us_market_open_exchange_rate',
+        name='Exchange Rate Update (US Market Open 09:30 ET)'
     )
 
     # 4. DB 일일 백업 (매일 05:10 KST)

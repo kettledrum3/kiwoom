@@ -2164,12 +2164,20 @@ class ValueRebalancingEngine:
             if preview: return []
             return
 
-        logger.info(f"리밸런싱 주문 계산. 목표 V: ${self.state.cycle_V:,.2f}")
+        cur_sym = "₩" if self.config.market == "KR" else "$"
+        def fmt_price_val(v):
+            if self.config.market == "KR": return f"{int(round(float(v))):,}"
+            return f"{float(v):,.2f}"
+
+        logger.info(f"리밸런싱 주문 계산. 목표 V: {cur_sym}{fmt_price_val(self.state.cycle_V)}")
         # [ADD] SELL_LIMIT_ONLY 필터인 경우 매수 로직은 건너뜁니다.
         if order_filter == "SELL_LIMIT_ONLY":
             logger.info(f"[{self.config.symbol}] SELL_LIMIT_ONLY 필터 적용. 매수 로직은 건너뛰고 매도만 진행합니다.")
         low_band = self.state.cycle_V * (self.config.band_low_pct / 100.0)
         high_band = self.state.cycle_V * (self.config.band_high_pct / 100.0)
+
+        submitted_sells = []
+        submitted_buys = []
 
         # --- 매도 주문 제출 ---
         if shares > 0:
@@ -2179,26 +2187,40 @@ class ValueRebalancingEngine:
                 if target_stock_val <= 0: break
                 limit_price = target_stock_val / (shares - n)
                 
-                # KR 대응: 호가 단위 보정 및 지정가(00) 강제
+                # 호가 단위 보정 및 일반 지정가(00) 적용 (한국/미국 공통 정규장 지정가 주문)
                 limit_price = self.broker.adjust_price_by_tick(symbol, limit_price, "SELL")
-                ptype = "30" if self.config.market == "US" else "00"
+                ptype = "00"
 
                 if limit_price > 0:
+                    order_desc = f"매도 {n+1}차"
                     if preview:
                         if not self._is_already_ordered("SELL", limit_price, 1, open_orders_pool):
                             planned_orders.append({
                                 "strategy": "VR", "side": "SELL", "symbol": symbol,
-                                "qty": 1, "price": limit_price, "type": ptype, "desc": f"VR_Sell_{n}th"
+                                "qty": 1, "price": limit_price, "type": ptype, "desc": order_desc
                             })
                     else:
                         if not self._is_already_ordered("SELL", limit_price, 1, open_orders_pool):
-                            self.broker.place_order(self.config.symbol, limit_price, 1, "SELL", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
+                            success = self.broker.place_order(self.config.symbol, limit_price, 1, "SELL", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
+                            if success:
+                                submitted_sells.append({"desc": order_desc, "price": limit_price, "qty": 1})
                             time.sleep(0.2) # API rate limit
                         else: # type: ignore
                             logger.info(f"-> [VR 매도] {limit_price} 동일 주문 존재. 스킵.")
 
         # [ADD] SELL_LIMIT_ONLY 필터인 경우 매수 로직은 건너뜁니다.
-        if order_filter == "SELL_LIMIT_ONLY": return planned_orders if preview else None
+        if order_filter == "SELL_LIMIT_ONLY":
+            if not preview and submitted_sells and self.config.use_db:
+                symbol_display = format_symbol_display(symbol, self.config.market)
+                tg_msg = f"🛒 <b>[{self.config.market} VR 지정가 매도 예약 주문]</b>\n"
+                tg_msg += f"종목: <b>{symbol_display}</b> ({self.config.strategy_name})\n"
+                tg_msg += f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                tg_msg += f"보유 수량: {shares:.0f}주 | 가용 Pool: {cur_sym}{fmt_price_val(allocated_pool)}\n\n"
+                tg_msg += f"📈 <b>매도 예약 ({len(submitted_sells)}건)</b>\n"
+                for s in submitted_sells:
+                    tg_msg += f"• {s['desc']}: {cur_sym}{fmt_price_val(s['price'])} ({s['qty']}주)\n"
+                send_telegram_message(tg_msg)
+            return planned_orders if preview else None
 
         # --- 매수 주문 제출 ---
         limit_ratio = (self.state.pool_limit_pct / 100.0) if hasattr(self.state, 'pool_limit_pct') else 0.5
@@ -2210,28 +2232,52 @@ class ValueRebalancingEngine:
             if target_stock_val <= 0: break
             limit_price = target_stock_val / (shares + n)
 
-            # KR 대응: 호가 단위 보정 및 지정가(00) 강제
+            # 호가 단위 보정 및 일반 지정가(00) 적용 (한국/미국 공통 정규장 지정가 주문)
             limit_price = self.broker.adjust_price_by_tick(symbol, limit_price, "BUY")
-            ptype = "30" if self.config.market == "US" else "00"
+            ptype = "00"
 
             if limit_price > 0:
                 if used_pool + limit_price > max_use_pool:
                     logger.info(f"-> [VR 매수 한도 제한] 누적 매수 주문 예정액({used_pool + limit_price:.2f})이 최대 사용 한도({max_use_pool:.2f})를 초과하여 매수 {n}차 주문부터는 중단합니다.")
                     break
 
+                order_desc = f"매수 {n}차"
                 if preview:
                     if not self._is_already_ordered("BUY", limit_price, 1, open_orders_pool):
                          planned_orders.append({
                                 "strategy": "VR", "side": "BUY", "symbol": symbol,
-                                "qty": 1, "price": limit_price, "type": ptype, "desc": f"VR_Buy_{n}th"
+                                "qty": 1, "price": limit_price, "type": ptype, "desc": order_desc
                             })
                          used_pool += limit_price
                 else:
                     if not self._is_already_ordered("BUY", limit_price, 1, open_orders_pool):
-                        self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
+                        success = self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
+                        if success:
+                            submitted_buys.append({"desc": order_desc, "price": limit_price, "qty": 1})
                         time.sleep(0.2) # API rate limit
                     used_pool += limit_price
         
+        # 텔레그램 발주 결과 리포트 전송
+        if not preview and (submitted_sells or submitted_buys) and self.config.use_db:
+            symbol_display = format_symbol_display(symbol, self.config.market)
+            tg_msg = f"🛒 <b>[{self.config.market} VR 지정가 예약 주문 접수]</b>\n"
+            tg_msg += f"종목: <b>{symbol_display}</b> ({self.config.strategy_name})\n"
+            tg_msg += f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            tg_msg += f"보유: {shares:.0f}주 | 가용 Pool: {cur_sym}{fmt_price_val(allocated_pool)}\n"
+            tg_msg += f"목표 V: {cur_sym}{fmt_price_val(self.state.cycle_V)} (Band: {cur_sym}{fmt_price_val(low_band)} ~ {cur_sym}{fmt_price_val(high_band)})\n"
+
+            if submitted_buys:
+                tg_msg += f"\n📉 <b>매수 예약 접수 ({len(submitted_buys)}건)</b>\n"
+                for b in submitted_buys:
+                    tg_msg += f"• {b['desc']}: {cur_sym}{fmt_price_val(b['price'])} ({b['qty']}주)\n"
+
+            if submitted_sells:
+                tg_msg += f"\n📈 <b>매도 예약 접수 ({len(submitted_sells)}건)</b>\n"
+                for s in submitted_sells:
+                    tg_msg += f"• {s['desc']}: {cur_sym}{fmt_price_val(s['price'])} ({s['qty']}주)\n"
+
+            send_telegram_message(tg_msg)
+
         return planned_orders if preview else None
 
     def run_cycle(self, date, contribution: float = 0.0, is_cycle_start_day: bool = False):

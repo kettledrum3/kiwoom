@@ -999,38 +999,49 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                 tax = round(principal * tax_rate, 2)
                 total_amount = principal - fee - tax
             
-            # Calculate Profit if SELL
+            # Calculate Profit if SELL & Track avg_price for both BUY and SELL
             realized_profit = 0.0
             realized_profit_rate = 0.0
             avg_price_at_trade = 0.0
-            
-            if side == "SELL":
-                # Get current avg_price from state if possible
-                cursor.execute('SELECT state_json FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND strategy=? AND market=? AND strategy_name=?', 
-                               (symbol, f"{symbol} %", strategy_to_save, market, target_alias))
-                row_st = cursor.fetchone()
-                if row_st:
-                    st_json = json.loads(row_st[0])
-                    avg_price_at_trade = float(st_json.get('avg_price', 0))
-                    
-                    # [FIX] 만약 상태 정보에 평단가가 0이라면, trade_history에서 해당 별칭의 마지막 유효 평단가 탐색
-                    if avg_price_at_trade <= 0:
-                        cursor.execute('''
-                            SELECT avg_price FROM trade_history 
-                            WHERE symbol=? AND market=? AND strategy_name=? AND avg_price > 0 
-                            ORDER BY date DESC, id DESC LIMIT 1
-                        ''', (symbol, market, target_alias))
-                        row_th = cursor.fetchone()
-                        if row_th:
-                            avg_price_at_trade = row_th[0]
 
-                    # 매수 시점의 추정 비용(원금 + 수수료) 계산
-                    # SYNC인 경우에도 현재 로드된 fee_rate를 사용
-                    cost_basis = avg_price_at_trade * qty * (1 + fee_rate)
-                    
-                    realized_profit = total_amount - cost_basis
-                    if cost_basis > 0:
-                        realized_profit_rate = (realized_profit / cost_basis) * 100
+            # 1. 상태 정보(State)에서 평단가 및 보유수량 탐색
+            cursor.execute('SELECT state_json FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND strategy=? AND market=? AND strategy_name=?', 
+                           (symbol, f"{symbol} %", strategy_to_save, market, target_alias))
+            row_st = cursor.fetchone()
+            st_avg = 0.0
+            st_shares = 0.0
+            if row_st:
+                try:
+                    st_json = json.loads(row_st[0])
+                    st_avg = float(st_json.get('avg_price', 0.0))
+                    st_shares = float(st_json.get('total_shares', 0.0))
+                except Exception:
+                    pass
+
+            # 2. 직전 trade_history에서 마지막 평단가 탐색
+            if st_avg <= 0:
+                cursor.execute('''
+                    SELECT avg_price FROM trade_history 
+                    WHERE symbol=? AND market=? AND strategy_name=? AND avg_price > 0 
+                    ORDER BY date DESC, id DESC LIMIT 1
+                ''', (symbol, market, target_alias))
+                row_th = cursor.fetchone()
+                if row_th and row_th[0] and float(row_th[0]) > 0:
+                    st_avg = float(row_th[0])
+
+            if side == "BUY":
+                if st_avg > 0 and st_shares > 0:
+                    avg_price_at_trade = ((st_shares * st_avg) + (qty * price)) / (st_shares + qty)
+                elif st_avg > 0:
+                    avg_price_at_trade = st_avg
+                else:
+                    avg_price_at_trade = price
+            elif side == "SELL":
+                avg_price_at_trade = st_avg if st_avg > 0 else price
+                cost_basis = avg_price_at_trade * qty * (1 + fee_rate)
+                realized_profit = total_amount - cost_basis
+                if cost_basis > 0:
+                    realized_profit_rate = (realized_profit / cost_basis) * 100
 
             odno_raw = ex.get('odno', 'N/A')
             # [NML] 주문번호 그대로 사용
