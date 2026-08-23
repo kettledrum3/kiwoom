@@ -733,6 +733,10 @@ class VRState(BaseState):
     cycle_V: float = 0.0
     cycle_start_pool: float = 0.0
 
+    # 당일 실행 추적 (중복 V값 재조정 및 중복 주문 방지용)
+    last_v_update_date: str = ""
+    last_order_date: str = ""
+
 # ==============================================================================
 # 상태 저장/로드 유틸리티
 # ==============================================================================
@@ -1450,18 +1454,38 @@ class CostAveragingEngine:
         old_alias = self.config.strategy_name
         finish_strategy_db(self.config.symbol, "CA", self.config.market, old_alias)
         
-        # 2. 다음 차수 생성
+        # 2. 다음 차수 생성 및 복리(Compound) 예산 산출
         next_alias = get_next_strategy_name(self.config.symbol, "CA", self.config.market)
         
-        # [수정] 1회 매수금(unit_buy_amount) 보호 로직
-        # 사용자가 설정한 고정 매수금이 있다면(config.unit_buy_amount > 0) 이를 최우선으로 사용합니다.
-        if self.config.unit_buy_amount > 0:
-            new_unit_buy = self.config.unit_buy_amount
-            new_budget = new_unit_buy * 40 # 기본 40회차 기준으로 예산 설정
+        # [복리(Compound) 설정] 이전 차수의 설정 예산에 실현 수익금을 합산하여 새 차수 예산 산정
+        prev_budget = self.state.cycle_budget if self.state.cycle_budget > 0 else (self.state.pool if self.state.pool > 0 else self.config.initial_budget)
+        if prev_budget <= 0:
+            prev_budget = self.config.unit_buy_amount * 40.0 if self.config.unit_buy_amount > 0 else 10000.0
+
+        # 실현 수익금(profit) 가산 (수익 발생 시 복리 증액, 손실 시 원금 보존)
+        if profit > 0:
+            new_budget = round(prev_budget + profit, 2) if self.config.market == "US" else float(int(prev_budget + profit))
         else:
-            new_budget = self.state.pool if self.state.pool > 0 else self.config.initial_budget
-            new_unit_buy = new_budget / 40 # 새 사이클은 항상 기본 40분할로 시작
+            new_budget = prev_budget
+
+        a_cnt = int(self.state.a_default) if getattr(self.state, 'a_default', 0) > 0 else (int(self.config.a_default) if getattr(self.config, 'a_default', 0) > 0 else 40)
+        new_unit_buy = round(new_budget / a_cnt, 2) if self.config.market == "US" else float(int(new_budget / a_cnt))
         
+        cur_sym = "₩" if self.config.market == "KR" else "$"
+        def fmt_v(v):
+            if self.config.market == "KR": return f"{int(v):,}"
+            return f"{v:,.2f}"
+
+        logger.info(f"📈 [복리 차수 전환] {old_alias} -> {next_alias} (이전 예산: {cur_sym}{fmt_v(prev_budget)} + 수익: {cur_sym}{fmt_v(profit)} => 새 예산: {cur_sym}{fmt_v(new_budget)}, 1회 매수금: {cur_sym}{fmt_v(new_unit_buy)} ({a_cnt}분할))")
+        
+        send_telegram_message(
+            f"🚀 <b>[CA 복리 차수 전환]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n"
+            f"이전 차수: {old_alias} 종료 (실현손익: +{cur_sym}{fmt_v(profit)})\n"
+            f"새로운 차수: <b>{next_alias}</b> 시작!\n"
+            f"전략 할당 예산: <b>{cur_sym}{fmt_v(new_budget)}</b> (복리 반영)\n"
+            f"1회 매수금: <b>{cur_sym}{fmt_v(new_unit_buy)}</b> ({a_cnt}분할)"
+        )
+
         new_state = CAState(
             symbol=self.config.symbol,
             strategy_type="CA",
@@ -1471,7 +1495,7 @@ class CostAveragingEngine:
             cycle_budget=new_budget,
             pool=new_budget,
             unit_buy_amount=new_unit_buy,
-            a_default=40, # 새 사이클 시작 시 분할 횟수 초기화
+            a_default=a_cnt, # 분할 횟수 유지
             total_profit=self.state.total_profit,
             mode="NORMAL",
             pending_cycle_transition=False, # 플래그 초기화
@@ -1481,6 +1505,8 @@ class CostAveragingEngine:
         # 3. 새 전략 저장 및 엔진 상태 전환
         save_state_db(new_state, market=self.config.market, strategy_name=next_alias)
         self.config.strategy_name = next_alias
+        self.config.unit_buy_amount = new_unit_buy
+        self.config.initial_budget = new_budget
         self.state = new_state
         
         # 4. 자동 재진입 매수 (현재가 + 오프셋 지정가)
@@ -2034,6 +2060,16 @@ class ValueRebalancingEngine:
             if open_orders_pool:
                 logger.info(f"[{symbol}] VR 미체결 주문 {len(open_orders_pool)}건 감지. 중복 주문은 제외합니다.")
 
+        # [ADD] 0. BOOTSTRAP_BUY_ONLY 필터 가드: RUNNING 모드인 전략은 부트스트랩 매수를 즉시 건너뜁니다.
+        if order_filter == "BOOTSTRAP_BUY_ONLY" and self.state.mode != 'BOOTSTRAP':
+            logger.info(f"⏭️ [{symbol}] 현재 전략 상태가 RUNNING(정상 운영)이므로 Bootstrap 시장가 매수를 건너뜁니다.")
+            return [] if preview else None
+
+        # [ADD] 0-1. 일반 배치 가드: BOOTSTRAP 모드인 전략은 개장 5분 후 일반 지정가 주문 배치를 건너뜁니다.
+        if order_filter != "BOOTSTRAP_BUY_ONLY" and self.state.mode == 'BOOTSTRAP':
+            logger.info(f"⏳ [{symbol}] 현재 초기 빌드업(Bootstrap) 단계입니다. 장 시작 30분 후 시장가 주문 배치를 기다립니다.")
+            return [] if preview else None
+
         # 1. 최신 잔고 및 시세 정보 조회
         equity_res = self.broker.get_account_equity(self.config.symbol)
         if equity_res is None:
@@ -2044,40 +2080,46 @@ class ValueRebalancingEngine:
         # [공식 수정] 공식문서(strategy_formula.md 105라인) 기준 E는 주식 평가액 단독입니다 (예수금 미합산).
         allocated_pool = self.state.pool
         E = eval_amt
+        today_str = date.strftime("%Y-%m-%d")
 
-        # 2. 사이클 시작일인 경우 V값 업데이트
-        if is_cycle_start_day and self.state.mode == 'RUNNING':
-            logger.info("새로운 VR 사이클 시작. V 및 밴드를 재계산합니다.")
-            if contribution != 0:
-                logger.info(f"주기적 입출금: ${contribution:.2f} 반영됨.")
+        # 2. 사이클 시작일인 경우 V값 업데이트 (RUNNING 모드이고 당일 아직 갱신되지 않은 경우에만 1회 실행)
+        if is_cycle_start_day and self.state.mode == 'RUNNING' and order_filter != "BOOTSTRAP_BUY_ONLY":
+            last_v_date = getattr(self.state, 'last_v_update_date', '')
+            if last_v_date == today_str:
+                logger.info(f"💵 [{symbol}] 오늘({today_str}) 이미 V값(${self.state.V:,.2f})이 갱신되었습니다. 중복 V 재계산을 건너뜁니다.")
+            else:
+                logger.info("새로운 VR 사이클 시작. V 및 밴드를 재계산합니다.")
+                if contribution != 0:
+                    logger.info(f"주기적 입출금: ${contribution:.2f} 반영됨.")
 
-            new_V = self._update_V_skill(E, contribution=contribution)
-            self.state.V = new_V
-            self.state.last_E = E
-            self.state.cycle_V = new_V
-            self.state.cycle_start_pool = allocated_pool
-            logger.info(f"새로운 목표밸류(V): ${self.state.V:,.2f}, E: ${E:,.2f}")
-            
-            # V값 갱신 알림
-            symbol_display = format_symbol_display(symbol, self.config.market)
-            prev_close = self.broker.get_previous_close(symbol)
-            cur_sym = "₩" if self.config.market == "KR" else "$"
-            def fmt_price(v):
-                if self.config.market == "KR": return f"{int(round(float(v))):,}"
-                return f"{float(v):,.2f}"
+                new_V = self._update_V_skill(E, contribution=contribution)
+                self.state.V = new_V
+                self.state.last_E = E
+                self.state.cycle_V = new_V
+                self.state.cycle_start_pool = allocated_pool
+                self.state.last_v_update_date = today_str
+                logger.info(f"새로운 목표밸류(V): ${self.state.V:,.2f}, E: ${E:,.2f}")
                 
-            msg = f"📅 <b>[VR 사이클 갱신]</b> {symbol_display}\n"
-            msg += f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            msg += f"전날 종가: {cur_sym}{fmt_price(prev_close)} | 현재가: {cur_sym}{fmt_price(current_price)}\n"
-            msg += f"새 목표 V: <b>{cur_sym}{fmt_price(self.state.V)}</b>\nPool: {cur_sym}{fmt_price(allocated_pool)}"
-            if self.config.use_db:
-                send_telegram_message(msg)
+                # V값 갱신 알림
+                symbol_display = format_symbol_display(symbol, self.config.market)
+                prev_close = self.broker.get_previous_close(symbol)
+                cur_sym = "₩" if self.config.market == "KR" else "$"
+                def fmt_price(v):
+                    if self.config.market == "KR": return f"{int(round(float(v))):,}"
+                    return f"{float(v):,.2f}"
+                    
+                msg = f"📅 <b>[VR 사이클 갱신]</b> {symbol_display}\n"
+                msg += f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                msg += f"전날 종가: {cur_sym}{fmt_price(prev_close)} | 현재가: {cur_sym}{fmt_price(current_price)}\n"
+                msg += f"새 목표 V: <b>{cur_sym}{fmt_price(self.state.V)}</b>\nPool: {cur_sym}{fmt_price(allocated_pool)}"
+                if self.config.use_db:
+                    send_telegram_message(msg)
 
-            # 상태 저장
-            if self.config.use_db and not preview:
-                save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
-            elif not preview:
-                save_state(self.state, self.config.save_path)
+                # 상태 저장
+                if self.config.use_db and not preview:
+                    save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
+                elif not preview:
+                    save_state(self.state, self.config.save_path)
 
         # 3. BOOTSTRAP 모드 처리
         if self.state.mode == 'BOOTSTRAP':
@@ -2143,6 +2185,7 @@ class ValueRebalancingEngine:
                     self.state.V = new_V
                     self.state.cycle_V = new_V
                     self.state.cycle_start_pool = self.state.pool
+                    self.state.last_v_update_date = today_str
                     
                     cur_sym = "₩" if self.config.market == "KR" else "$"
                     def fmt_val(v):
@@ -2277,6 +2320,13 @@ class ValueRebalancingEngine:
                     tg_msg += f"• {s['desc']}: {cur_sym}{fmt_price_val(s['price'])} ({s['qty']}주)\n"
 
             send_telegram_message(tg_msg)
+
+        if not preview:
+            self.state.last_order_date = today_str
+            if self.config.use_db:
+                save_state_db(self.state, market=self.state.market, strategy_name=self.state.strategy_name)
+            else:
+                save_state(self.state, self.config.save_path)
 
         return planned_orders if preview else None
 

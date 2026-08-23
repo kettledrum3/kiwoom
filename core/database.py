@@ -122,6 +122,31 @@ def init_db(run_maintenance=False):
             strategy_name TEXT -- Added strategy_name
         )
     ''')
+
+    # [ADD] 미국 정규장 개장 기준 일별 환율 테이블 (USD/KRW)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT UNIQUE,
+            recorded_at TEXT,
+            rate REAL,
+            base_rate REAL,
+            diff REAL,
+            pct REAL,
+            source TEXT DEFAULT 'KIWOOM'
+        )
+    ''')
+
+    # [ADD] IP 기반 로그인 세션 유지 테이블
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ip_auth_sessions (
+            ip TEXT PRIMARY KEY,
+            username TEXT,
+            email TEXT,
+            last_login TEXT,
+            is_active INTEGER DEFAULT 1
+        )
+    ''')
     
     # 전략 상태 저장 테이블 (JSON 형태로 상태 저장)
     # Migration for strategy_state PRIMARY KEY change to include trade_mode
@@ -999,12 +1024,35 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                 tax = round(principal * tax_rate, 2)
                 total_amount = principal - fee - tax
             
-            # Calculate Profit if SELL & Track avg_price for both BUY and SELL
-            realized_profit = 0.0
-            realized_profit_rate = 0.0
-            avg_price_at_trade = 0.0
+            odno_raw = ex.get('odno', 'N/A')
+            odno = str(odno_raw).strip() if odno_raw and str(odno_raw).strip() != 'N/A' else 'N/A'
 
-            # 1. 상태 정보(State)에서 평단가 및 보유수량 탐색
+            # 0. 주문번호(odno) 기반 전략/차수(strategy_name) 1순위 확정 (전략 간 데이터 간섭 원천 차단)
+            if odno and odno != 'N/A':
+                cursor.execute("SELECT strategy, strategy_name FROM order_history WHERE odno=?", (odno,))
+                orig_order = cursor.fetchone()
+                if orig_order and orig_order[1]:
+                    strategy_to_save = orig_order[0]
+                    target_alias = orig_order[1]
+                else:
+                    # 기존 trade_history에서 동일 odno의 전략 정보 확인
+                    cursor.execute("SELECT strategy, strategy_name FROM trade_history WHERE odno=? AND strategy_name IS NOT NULL AND strategy_name NOT IN ('', 'SYNC', 'MANUAL') LIMIT 1", (odno,))
+                    orig_trade = cursor.fetchone()
+                    if orig_trade and orig_trade[1]:
+                        strategy_to_save = orig_trade[0]
+                        target_alias = orig_trade[1]
+
+            # 만약 여전히 별칭이 없다면 strategy_state에서 해당 종목의 활성 별칭을 조회하여 보완
+            if not target_alias or target_alias in ['', 'SYNC', 'MANUAL']:
+                cursor.execute('''
+                    SELECT strategy, strategy_name FROM strategy_state 
+                    WHERE (symbol=? OR symbol LIKE ? OR symbol=? OR symbol LIKE ?) AND market=? AND is_active=1 LIMIT 1
+                ''', (symbol, f"{symbol} %", "A" + symbol, "A" + symbol + " %", market))
+                fallback = cursor.fetchone()
+                if fallback:
+                    strategy_to_save, target_alias = fallback
+
+            # 1. 확정된 해당 전략/차수(target_alias)의 독립 상태 정보(State)에서 평단가 및 보유수량 탐색
             cursor.execute('SELECT state_json FROM strategy_state WHERE (symbol=? OR symbol LIKE ?) AND strategy=? AND market=? AND strategy_name=?', 
                            (symbol, f"{symbol} %", strategy_to_save, market, target_alias))
             row_st = cursor.fetchone()
@@ -1018,7 +1066,7 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                 except Exception:
                     pass
 
-            # 2. 직전 trade_history에서 마지막 평단가 탐색
+            # 2. 직전 trade_history에서 해당 전략/차수(target_alias)의 마지막 평단가 탐색
             if st_avg <= 0:
                 cursor.execute('''
                     SELECT avg_price FROM trade_history 
@@ -1028,6 +1076,11 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                 row_th = cursor.fetchone()
                 if row_th and row_th[0] and float(row_th[0]) > 0:
                     st_avg = float(row_th[0])
+
+            # Calculate Profit if SELL & Track avg_price for both BUY and SELL
+            realized_profit = 0.0
+            realized_profit_rate = 0.0
+            avg_price_at_trade = 0.0
 
             if side == "BUY":
                 if st_avg > 0 and st_shares > 0:
@@ -1043,24 +1096,20 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
                 if cost_basis > 0:
                     realized_profit_rate = (realized_profit / cost_basis) * 100
 
-            odno_raw = ex.get('odno', 'N/A')
-            # [NML] 주문번호 그대로 사용
-            odno = str(odno_raw) if odno_raw != 'N/A' else 'N/A'
-            
-            # 2. 중복 체크 강화: odno 컬럼뿐만 아니라 note 필드 내 텍스트까지 검색
+            # 3. 중복 체크 강화: odno 컬럼뿐만 아니라 note 필드 내 텍스트까지 검색
             is_duplicate = False
             if odno and odno != 'N/A':
                 cursor.execute("SELECT id, qty FROM trade_history WHERE (odno=? OR note LIKE ?) AND market=?", (odno, f'%{odno}%', market))
                 existing = cursor.fetchone()
                 if existing and existing[0] not in processed_db_ids:
                     is_duplicate = True
-                    # [개선] 기존 기록이 있지만 별칭이 일반(MANUAL/SYNC)인 경우 현재 전략으로 업데이트
+                    # 기존 기록이 있지만 별칭이 일반(MANUAL/SYNC)인 경우 현재 전략으로 업데이트
                     cursor.execute('SELECT strategy, strategy_name FROM trade_history WHERE id=?', (existing[0],))
                     row_check = cursor.fetchone()
                     curr_strat, curr_alias = row_check if row_check else (None, None)
                     
                     curr_alias_clean = str(curr_alias).strip() if curr_alias else ""
-                    target_alias_clean = str(target_alias).strip() if target_alias else "" # type: ignore
+                    target_alias_clean = str(target_alias).strip() if target_alias else ""
 
                     if target_alias_clean and curr_alias_clean != target_alias_clean and curr_alias_clean in ['', 'SYNC', 'MANUAL']:
                         cursor.execute('UPDATE trade_history SET strategy=?, strategy_name=? WHERE id=?', 
@@ -1080,25 +1129,9 @@ def sync_trade_history_db(symbol, executions, strategy=None, market="US", strate
             if is_duplicate:
                 continue
 
-            # [ADD] Alias 복구: order_history에 기록된 원래 전략 정보를 찾아 연결
-            cursor.execute("SELECT strategy, strategy_name FROM order_history WHERE odno=?", (odno,))
-            orig_info = cursor.fetchone()
-            if orig_info and (strategy_to_save in ['SYNC', 'MANUAL'] or not target_alias):
-                strategy_to_save = orig_info[0]
-                target_alias = orig_info[1]
-            
-            # [ADD] 만약 여전히 별칭이 없다면 strategy_state에서 해당 종목의 활성 별칭을 조회하여 보완
-            if not target_alias or target_alias in ['', 'SYNC', 'MANUAL']:
-                cursor.execute('''
-                    SELECT strategy, strategy_name FROM strategy_state 
-                    WHERE (symbol=? OR symbol LIKE ? OR symbol=? OR symbol LIKE ?) AND market=? AND is_active=1 LIMIT 1
-                ''', (symbol, f"{symbol} %", "A" + symbol, "A" + symbol + " %", market))
-                fallback = cursor.fetchone()
-                if fallback:
-                    strategy_to_save, target_alias = fallback
-
-            # [ADD] 체결이 확인되었으므로 미체결 주문 내역(order_history)에서 즉시 삭제 (중복 방지 강화)
-            cursor.execute("DELETE FROM order_history WHERE odno=? AND (symbol=? OR symbol=?)", (odno, symbol, "A" + symbol))
+            # 체결이 확인되었으므로 미체결 주문 내역(order_history)에서 삭제
+            if odno and odno != 'N/A':
+                cursor.execute("DELETE FROM order_history WHERE odno=? AND (symbol=? OR symbol=?)", (odno, symbol, "A" + symbol))
 
             # 3. 주문번호가 없는 기존 기록 중 동일 조건 검색 (병합 처리)
             cursor.execute('''
@@ -1655,6 +1688,147 @@ def get_holdings_from_db(symbol, market, strategy_name):
     except Exception as e:
         logger.error(f"Error in get_holdings_from_db: {e}")
         return 0.0, 0.0, 0.0
+
+# ==========================================
+# 미국 정규장 개장 기준 일별 환율(USD/KRW) 관리 함수
+# ==========================================
+
+def save_exchange_rate_db(trade_date: str, recorded_at: str, rate: float, base_rate: float, diff: float, pct: float, source: str = "KIWOOM") -> bool:
+    """미국 정규장 개장 기준 일별 환율 저장 (이미 존재할 경우 덮어쓰기/업데이트)"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO exchange_rates (trade_date, recorded_at, rate, base_rate, diff, pct, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                recorded_at=excluded.recorded_at,
+                rate=excluded.rate,
+                base_rate=excluded.base_rate,
+                diff=excluded.diff,
+                pct=excluded.pct,
+                source=excluded.source
+        """, (trade_date, recorded_at, rate, base_rate, diff, pct, source))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error saving exchange rate to DB: {e}")
+        return False
+
+def get_exchange_rate_by_date_db(trade_date: str) -> dict:
+    """특정 미국 거래일의 환율 정보 조회"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT trade_date, recorded_at, rate, base_rate, diff, pct, source
+            FROM exchange_rates
+            WHERE trade_date = ?
+        """, (trade_date,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "trade_date": row[0],
+                "recorded_at": row[1],
+                "rate": float(row[2]),
+                "base_rate": float(row[3]),
+                "diff": float(row[4]),
+                "pct": float(row[5]),
+                "source": row[6]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching exchange rate for date {trade_date}: {e}")
+        return None
+
+def get_previous_exchange_rate_db(trade_date: str) -> dict:
+    """특정 미국 거래일 이전의 가장 최근 개장 환율 레코드 조회 (전일 환율 기준용)"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT trade_date, recorded_at, rate, base_rate, diff, pct, source
+            FROM exchange_rates
+            WHERE trade_date < ?
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """, (trade_date,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "trade_date": row[0],
+                "recorded_at": row[1],
+                "rate": float(row[2]),
+                "base_rate": float(row[3]),
+                "diff": float(row[4]),
+                "pct": float(row[5]),
+                "source": row[6]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching previous exchange rate before {trade_date}: {e}")
+        return None
+
+def get_latest_exchange_rate_db() -> dict:
+    """가장 최근에 저장된 개장 환율 레코드 조회"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT trade_date, recorded_at, rate, base_rate, diff, pct, source
+            FROM exchange_rates
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "trade_date": row[0],
+                "recorded_at": row[1],
+                "rate": float(row[2]),
+                "base_rate": float(row[3]),
+                "diff": float(row[4]),
+                "pct": float(row[5]),
+                "source": row[6]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching latest exchange rate from DB: {e}")
+        return None
+
+def get_exchange_rate_history_db(days: int = 60) -> list:
+    """최근 n일간의 미국 개장 환율 이력 조회 (날짜 오름차순)"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT trade_date, recorded_at, rate, base_rate, diff, pct, source
+            FROM exchange_rates
+            ORDER BY trade_date DESC
+            LIMIT ?
+        """, (days,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        result = []
+        for row in reversed(rows):
+            result.append({
+                "trade_date": row[0],
+                "recorded_at": row[1],
+                "rate": float(row[2]),
+                "base_rate": float(row[3]),
+                "diff": float(row[4]),
+                "pct": float(row[5]),
+                "source": row[6]
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching exchange rate history from DB: {e}")
+        return []
 
 if __name__ == "__main__":
     init_db()

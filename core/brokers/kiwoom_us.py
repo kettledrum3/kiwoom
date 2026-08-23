@@ -237,9 +237,9 @@ class KiwoomUsBroker(Broker):
         return 0.0
 
     def get_exchange_rate(self, force: bool = False) -> dict:
-        """환율 조회 (Exchangerate.host API 우선 적용 및 키움 ust31301 API Fallback 이중화)"""
+        """환율 조회 (키움 ust31301 API 우선 적용 및 Exchangerate.host API Fallback 이중화)"""
         import pytz
-        from core.database import get_config, set_config
+        from core.database import get_config, set_config, get_latest_exchange_rate_db
         
         # 1. 미국 동부 시각(America/New_York) 기준 오늘 날짜 획득
         ny_tz = pytz.timezone('America/New_York')
@@ -248,7 +248,7 @@ class KiwoomUsBroker(Broker):
         # 0. 메모리 캐시 확인 (강제 조회가 아니고, 오늘 날짜 캐시가 존재하면 갱신 안 함)
         if not force and hasattr(self, '_exchange_rate_cache') and self._exchange_rate_cache:
             cache_date, cache_data = self._exchange_rate_cache
-            if cache_date == today_str:
+            if cache_date == today_str and cache_data.get("rate", 0) > 0:
                 return cache_data
 
         # 0-1. DB 캐시 확인 (강제 조회가 아니고, 오늘 날짜로 DB에 저장된 환율이 존재하면 그것을 우선 사용)
@@ -263,122 +263,115 @@ class KiwoomUsBroker(Broker):
                         res_dict = {
                             "rate": db_rate,
                             "diff": 0.0,
-                            "pct": 0.0
+                            "pct": 0.0,
+                            "source": "DB_CACHE"
                         }
                         self._exchange_rate_cache = (today_str, res_dict)
                         return res_dict
                 except ValueError:
                     pass
-        
-        ex_key = os.getenv("EXCHANGERATE_KEY", "").strip()
-        use_external_api = False
-        
-        if ex_key:
-            # 2. 일일 호출 횟수 파싱
-            call_date = get_config("EXCHANGERATE_CALL_DATE", "")
-            try:
-                call_count = int(get_config("EXCHANGERATE_CALL_COUNT", "0"))
-            except ValueError:
-                call_count = 0
-                
-            if call_date != today_str:
-                call_count = 0 # 날짜가 달라졌으므로 초기화
-                
-            # 3. 호출 횟수가 3회 이상(하루 4회째 요청부터)인 경우
-            if call_count >= 3:
-                logger.info(f"⚠️ [ExchangeRate] 오늘 외부 환율 API 일일 호출 한도(3회)를 초과하였습니다. (현재 요청 시도: {call_count + 1}회)")
-                
-                # DB에 기저장된 오늘 자 환율 정보를 로드
-                db_rate_str = get_config("USDKRW", "")
-                db_rate_date = get_config("USDKRW_UPDATE_DATE", "")
-                
-                if db_rate_date == today_str and db_rate_str:
-                    try:
-                        db_rate = float(db_rate_str)
-                        if db_rate > 0:
-                            logger.info(f"💵 [ExchangeRate] 3회 초과 호출로 인해 DB에 이미 저장된 오늘 자 환율을 반환합니다: {db_rate:.2f}원")
-                            res_dict = {
-                                "rate": db_rate,
-                                "diff": 0.0,
-                                "pct": 0.0
-                            }
-                            self._exchange_rate_cache = (today_str, res_dict)
-                            return res_dict
-                    except ValueError:
-                        pass
-                logger.warning(f"⚠️ [ExchangeRate] DB에 저장된 오늘 자 환율 정보가 없어 키움 API로 조회를 대체합니다.")
-            else:
-                use_external_api = True
 
-        if use_external_api:
-            try:
-                # exchangerate.host API 호출
-                api_url = f"https://api.exchangerate.host/live?access_key={ex_key}&symbols=KRW"
-                logger.info(f"[ExchangeRate] Exchangerate.host API를 통한 환율 조회를 시도합니다. (오늘 호출 횟수: {call_count + 1}/3)")
-                response = requests.get(api_url, timeout=5.0)
-                
-                # [DEBUG LOG ADDED] API 요청 세부사항 및 원본 응답 내용 로깅
-                logger.debug(f"[ExchangeRate Debug] API URL: {api_url.replace(ex_key, '***HIDDEN***')}")
-                logger.debug(f"[ExchangeRate Debug] Status Code: {response.status_code}")
-                logger.debug(f"[ExchangeRate Debug] Response Headers: {dict(response.headers)}")
-                logger.debug(f"[ExchangeRate Debug] Response Text: {response.text}")
-                
-                if response.status_code == 200:
-                    res_data = response.json()
-                    if res_data.get("success"):
-                        quotes = res_data.get("quotes", {})
-                        rate = float(quotes.get("USDKRW", 0.0))
-                        if rate > 0:
-                            # 성공 시에만 호출 횟수 기록 갱신
-                            set_config("EXCHANGERATE_CALL_DATE", today_str)
-                            set_config("EXCHANGERATE_CALL_COUNT", str(call_count + 1))
-                            logger.info(f"💵 [ExchangeRate] Exchangerate.host 최신 환율 조회 성공: 1달러당 {rate:.2f}원 (누적 {call_count + 1}회)")
-                            res_dict = {
-                                "rate": rate,
-                                "diff": 0.0,
-                                "pct": 0.0
-                            }
-                            self._exchange_rate_cache = (today_str, res_dict)
-                            return res_dict
-                        else:
-                            logger.warning("⚠️ [ExchangeRate] Exchangerate.host API 응답에서 USDKRW 환율 값을 찾을 수 없거나 0 이하입니다.")
-                    else:
-                        logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API success 필드가 False입니다. Error Info: {res_data.get('error')}")
-                else:
-                    err_msg = f"Status: {response.status_code}"
-                    if response.status_code == 429:
-                        err_msg += " (Too Many Requests - API rate limit exceeded)"
-                    logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host 응답이 올바르지 않습니다. ({err_msg}, Body: {response.text[:200]})")
-            except Exception as e:
-                logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host API 호출 중 오류 발생: {e}. 키움 API로 대체하여 조회합니다.")
-
-        # Fallback 또는 API Key 부재 또는 오늘 자 DB 조회 실패 시: 기존 키움 ust31301 API 연동
+        # 1순위: 키움증권 ust31301 API를 최우선으로 사용하여 환율 조회
         logger.info(f"[ExchangeRate] 키움증권 ust31301 API를 사용하여 환율을 조회합니다.")
-        url = f"{self.base_url}/api/us/exchange"
-        body = {
-            "exch_tp": "2" # 2: 달러(USD) -> 원화(KRW) 환율
-        }
-        res = self._call_api("POST", url, "ust31301", data=json.dumps(body))
-        if res:
-            data = res.json()
-            if data.get('return_code') == 0:
-                rate = float(data.get('aplc_exrt', 0))
-                logger.info(f"💵 [ExchangeRate] 키움증권 API 환율 조회 성공: 1달러당 {rate:.2f}원")
-                res_dict = {
-                    "rate": rate,
-                    "diff": 0.0,
-                    "pct": 0.0
-                }
-                self._exchange_rate_cache = (today_str, res_dict)
-                return res_dict
-        res_dict = {"rate": 0.0, "diff": 0.0, "pct": 0.0}
+        try:
+            url = f"{self.base_url}/api/us/exchange"
+            body = {
+                "exch_tp": "2" # 2: 달러(USD) -> 원화(KRW) 환율
+            }
+            res = self._call_api("POST", url, "ust31301", data=json.dumps(body))
+            if res:
+                data = res.json()
+                if data.get('return_code') == 0:
+                    rate = float(data.get('aplc_exrt', 0))
+                    if rate > 0:
+                        logger.info(f"💵 [ExchangeRate] 키움증권 API 환율 조회 성공: 1달러당 {rate:.2f}원")
+                        res_dict = {
+                            "rate": rate,
+                            "diff": 0.0,
+                            "pct": 0.0,
+                            "source": "KIWOOM"
+                        }
+                        self._exchange_rate_cache = (today_str, res_dict)
+                        return res_dict
+                    else:
+                        logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 응답에서 환율 값이 0 이하입니다: {data}")
+                else:
+                    logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 오류: {data.get('return_msg', '알 수 없는 오류')}")
+        except Exception as e:
+            logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 환율 조회 중 오류 발생: {e}")
+
+        # 2순위 (Fallback): 키움증권 API 실패 시에만 외부 Exchangerate.host API 호출 시도
+        ex_key = os.getenv("EXCHANGERATE_KEY", "").strip()
+        if ex_key:
+            try:
+                call_date = get_config("EXCHANGERATE_CALL_DATE", "")
+                try:
+                    call_count = int(get_config("EXCHANGERATE_CALL_COUNT", "0"))
+                except ValueError:
+                    call_count = 0
+                    
+                if call_date != today_str:
+                    call_count = 0
+                    
+                if call_count < 3:
+                    api_url = f"https://api.exchangerate.host/live?access_key={ex_key}&symbols=KRW"
+                    logger.info(f"[ExchangeRate] 키움 API 대체로 Exchangerate.host API를 시도합니다. (호출: {call_count + 1}/3)")
+                    response = requests.get(api_url, timeout=5.0)
+                    if response.status_code == 200:
+                        res_data = response.json()
+                        if res_data.get("success"):
+                            quotes = res_data.get("quotes", {})
+                            rate = float(quotes.get("USDKRW", 0.0))
+                            if rate > 0:
+                                set_config("EXCHANGERATE_CALL_DATE", today_str)
+                                set_config("EXCHANGERATE_CALL_COUNT", str(call_count + 1))
+                                logger.info(f"💵 [ExchangeRate] Exchangerate.host 최신 환율 조회 성공: 1달러당 {rate:.2f}원")
+                                res_dict = {
+                                    "rate": rate,
+                                    "diff": 0.0,
+                                    "pct": 0.0,
+                                    "source": "EXCHANGERATE_HOST"
+                                }
+                                self._exchange_rate_cache = (today_str, res_dict)
+                                return res_dict
+            except Exception as e:
+                logger.warning(f"⚠️ [ExchangeRate] Exchangerate.host Fallback 호출 실패: {e}")
+
+        # 3순위: 최근 DB 저장 환율 반환
+        latest_record = get_latest_exchange_rate_db()
+        if latest_record and latest_record.get("rate", 0) > 0:
+            db_rate = latest_record["rate"]
+            logger.info(f"💵 [ExchangeRate] API 호출 실패로 DB 최근 환율을 사용합니다: 1달러당 {db_rate:.2f}원 (기준일: {latest_record.get('trade_date')})")
+            res_dict = {
+                "rate": db_rate,
+                "diff": latest_record.get("diff", 0.0),
+                "pct": latest_record.get("pct", 0.0),
+                "source": "DB_FALLBACK"
+            }
+            self._exchange_rate_cache = (today_str, res_dict)
+            return res_dict
+
+        res_dict = {"rate": 0.0, "diff": 0.0, "pct": 0.0, "source": "NONE"}
         self._exchange_rate_cache = (today_str, res_dict)
         return res_dict
 
-    def get_exchange_rate_history(self, start_date: str, end_date: str) -> List[dict]:
-        # 환율 이력을 구하는 TR이 단일 시트에 없으므로 현재 환율을 활용하거나 기존 방식을 대체
+    def get_exchange_rate_history(self, start_date: str = "", end_date: str = "") -> List[dict]:
+        """DB에 저장된 미국 정규장 개장 기준 일별 환율 이력 반환"""
+        from core.database import get_exchange_rate_history_db
+        db_history = get_exchange_rate_history_db(days=90)
+        if db_history:
+            return db_history
+        # DB에 이력이 없으면 현재 환율로 1건 생성
         rate_info = self.get_exchange_rate()
-        return [{"date": datetime.now().strftime("%Y%m%d"), "rate": rate_info["rate"]}]
+        return [{
+            "trade_date": datetime.now().strftime("%Y-%m-%d"),
+            "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "rate": rate_info["rate"],
+            "base_rate": rate_info["rate"],
+            "diff": 0.0,
+            "pct": 0.0,
+            "source": rate_info.get("source", "KIWOOM")
+        }]
 
     def get_account_equity(self, symbol: str) -> Optional[Tuple[float, float, float]]:
         """ust21070 (미국주식 원장잔고확인) API 연동"""

@@ -207,3 +207,69 @@ def update_user_email(old_email, new_email):
         return False
     finally:
         conn.close()
+
+# ==========================================
+# IP 기반 세션 유지(Auto-login) 관리 함수
+# ==========================================
+
+def save_ip_session(ip: str, username: str, email: str):
+    """클라이언트 IP 기반 세션 저장 (동일 IP 재접속 시 자동 로그인용)"""
+    if not ip:
+        return
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO ip_auth_sessions (ip, username, email, last_login, is_active)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(ip) DO UPDATE SET
+                username=excluded.username,
+                email=excluded.email,
+                last_login=excluded.last_login,
+                is_active=1
+        """, (ip, username, email, now_str))
+        conn.commit()
+        conn.close()
+        logger.info(f"🔑 [Auth] IP 세션 저장 완료: {ip} -> {username} ({email})")
+    except Exception as e:
+        logger.error(f"Failed to save IP session for {ip}: {e}")
+
+def get_ip_session(ip: str) -> dict:
+    """IP 기반 활성 세션 조회"""
+    if not ip:
+        return None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT username, email, last_login, is_active
+            FROM ip_auth_sessions
+            WHERE ip = ? AND is_active = 1
+        """, (ip,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "username": row[0],
+                "email": row[1],
+                "last_login": row[2]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Failed to get IP session for {ip}: {e}")
+        return None
+
+def clear_ip_session(ip: str):
+    """로그아웃 시 IP 세션 비활성화"""
+    if not ip:
+        return
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE ip_auth_sessions SET is_active=0 WHERE ip=?", (ip,))
+        conn.commit()
+        conn.close()
+        logger.info(f"🔒 [Auth] IP 세션 비활성화 완료 (로그아웃): {ip}")
+    except Exception as e:
+        logger.error(f"Failed to clear IP session for {ip}: {e}")

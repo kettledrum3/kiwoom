@@ -592,10 +592,40 @@
     - [core/scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py): 기존 장 마감(16:05 ET) 기준 환율 갱신에서 **미국 정규장 개장 시각(09:30 ET / 서머타임 22:30 KST)** 기준으로 개편함.
     - 당일 개장 환율을 기준 환율(`USDKRW`)로 설정하고, 전일 기준 환율(`USDKRW_BASE_RATE`)도 **전날 같은 시각(09:30 ET)의 개장 환율**로 지정하여 변동폭 및 변동률이 정확히 산출되도록 구현함.
     - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 대시보드 환율 라벨을 `환율 (정규장 개장 09:30 ET 기준)` 및 캡션(`기준: 전일 개장 대비`)으로 일치시킴.
-*   **단위 테스트 검증 완료**:
-    - 전체 20개 테스트 스위트 100% 정상 통과(`OK`).
+### 📅 2026-08-23 (미국 정규장 개장 환율 DB 관리 및 대시보드 차트화)
+*   **미국 정규장 개장 기준 일별 환율 테이블(`exchange_rates`) 신설 및 이력 관리**:
+    - [core/database.py](file:///d:/Python_D/kiwoom/core/database.py): `exchange_rates` (`trade_date`, `recorded_at`, `rate`, `base_rate`, `diff`, `pct`, `source`) 테이블 및 CRUD 함수(`save_exchange_rate_db`, `get_exchange_rate_by_date_db`, `get_previous_exchange_rate_db`, `get_exchange_rate_history_db`) 신설.
+    - [core/brokers/kiwoom_us.py](file:///d:/Python_D/kiwoom/core/brokers/kiwoom_us.py): 키움 `ust31301` API를 1순위로 호출하여 환율을 획득하고, 성공 시 외부 API(`exchangerate.host`) 조회를 생략하도록 최적화.
+*   **당일 개장 환율 중복 저장/알림 방지 및 직전 거래일 기준 산출**:
+    - [core/scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py): 미국 정규장 개장 시각(서머타임 22:30 / 표준 23:30 KST)에 환율을 저장하며, 당일 이미 기록이 존재할 경우 중복 저장 및 알림 발송을 건너뛰도록 차단. 직전 거래일의 개장 환율을 DB에서 안전하게 가져와 전일 대비 변동폭(`diff`)과 등락률(`pct`)을 정확히 산출.
+*   **대시보드 실시간 환율 조회 격리 및 일별 환율 Plotly 차트 제공**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): "🔄 지금 환율 조회" 버튼 클릭 시 DB에 기록을 덮어쓰지 않고 `st.session_state`를 통해 화면에만 임시 배너로 표시하도록 분리.
+    - 분석 탭 하단에 `render_exchange_rate_expander`를 추가하여 일별 정규장 개장 환율 변동 그래프(Plotly)와 상세 이력 테이블을 제공.
 
+### 📅 2026-08-23 (VR 부트스트랩과 RUNNING 모드 스케줄 완전 분리 및 V값 재계산 방어)
+*   **`RUNNING` 모드와 `BOOTSTRAP` 모드의 배치 실행 상호 배타적 분리**:
+    - [core/scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py): 개장 30분 후 실행되는 `job_vr_bootstrap_market_buys`(`order_filter="BOOTSTRAP_BUY_ONLY"`)에서 `mode != 'BOOTSTRAP'`인 정상 운영 전략(`RUNNING`)은 즉시 건너뛰도록 차단(`continue`)하고 `is_cycle_day = False`로 고정.
+    - 일반 개장 5분 후 배치(`job_market_open`)에서는 `mode == 'BOOTSTRAP'`인 초기 10일 빌드업 전략을 건너뛰고 30분 후 전용 배치를 대기하도록 정비.
+*   **VR 엔진 당일 V값 중복 갱신 차단 및 주문 이력 관리**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `VRState`에 `last_v_update_date` 및 `last_order_date` 필드 추가.
+    - `place_daily_limit_orders`에서 당일 이미 V값이 갱신된 경우(`last_v_update_date == today_str`), 장중 체결이나 시세 변동에 의해 V값과 밴드가 다시 흔들리지 않도록 중복 재계산을 원천 차단.
 
+### 📅 2026-08-23 (동일 IP 기반 대시보드 로그인 유지 Auto-login 기능 구현)
+*   **IP 세션 관리 테이블(`ip_auth_sessions`) 구축**:
+    - [core/database.py](file:///d:/Python_D/kiwoom/core/database.py): `ip_auth_sessions` (`ip`, `username`, `email`, `last_login`, `is_active`) 테이블 신설.
+    - [core/auth.py](file:///d:/Python_D/kiwoom/core/auth.py): `save_ip_session`, `get_ip_session`, `clear_ip_session` 함수 구현.
+*   **대시보드 자동 로그인 및 로그아웃 연동**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): `get_client_ip()` 함수로 요청 헤더(`st.context.headers`, `X-Forwarded-For`, `Remote-Addr`)에서 클라이언트 IP를 추출.
+    - 세션이 없는 상태에서 동일 IP의 활성 세션이 확인되면 자동으로 로그인 처리 및 UI 설정(시장, 종목)을 복원.
+    - 사이드바 '로그아웃' 버튼 클릭 시 해당 IP 세션을 비활성화(`is_active = 0`)하여 보안 유지.
 
-
-
+### 📅 2026-08-23 (CA 전략 UI 순서/자동계산 개선, 가용예수금 명칭 변경, 복리 차수전환 및 주문번호 격리)
+*   **사이드바 CA 설정 순서 재배치 및 1회 매수금 자동 계산**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 설정 순서를 `전략 할당 예수금` $\rightarrow$ `버전 선택` $\rightarrow$ `분할 횟수 (a)` $\rightarrow$ `1회 매수 금액` 순으로 재배치.
+    - `전략 할당 예수금 / 분할 횟수`로 `1회 매수 금액`이 자동 계산되어 기본 바인딩되도록 개선.
+*   **대시보드 메트릭 명칭 변경**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 현재 작업 대상 화면 상단 메트릭 라벨을 `💰 전략 할당 예수금`에서 **`💰 전략 가용 예수금`**으로 변경하여 계좌 내 실시간 가용 풀 예수금임을 명확화.
+*   **CA 전량 매도 후 차수 전환 시 복리(Compound) 기본 적용**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 잔고가 0이 되어 다음 차수(예: SOXL_2차 $\rightarrow$ SOXL_3차)로 전환될 때, 직전 차수에서 실현된 수익금을 이전 예산에 합산하여 새 차수 예산을 산정하고 1회 매수금을 복리로 자동 산출 ($\text{새 예산} = \text{직전 예산} + \text{실현 수익금}$, $\text{새 1회 매수금} = \text{새 예산} / a$).
+*   **주문번호(`odno`) 기반 체결 동기화 및 전략 독립성 보장**:
+    - [core/database.py](file:///d:/Python_D/kiwoom/core/database.py): 주문 제출 즉시 고유 주문번호(`odno`)와 `strategy_name`을 `order_history`에 선기록하고, 거래소 체결 동기화(`sync_trade_history_db`) 시 `odno`를 1순위로 조회하여 해당 주문을 발행한 특정 전략/차수에만 체결 내역과 평단가, 잔고를 100% 독립 귀속. 타 차수 및 타 종목 간 데이터 간섭 원천 차단.

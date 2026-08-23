@@ -226,8 +226,21 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
     for i, state_data in enumerate(vr_states):
         symbol = state_data.get('symbol')
         alias = state_data.get('strategy_name', '')
+        mode = state_data.get('mode', 'RUNNING')
         freq = state_data.get('freq', '격주 금요일 (2주)')
-        is_cycle_day = check_vr_cycle_day(today, freq)
+
+        # [ADD] 1. BOOTSTRAP_BUY_ONLY 호출 시 RUNNING 모드 전략은 완전 제외
+        if order_filter == "BOOTSTRAP_BUY_ONLY":
+            if mode != 'BOOTSTRAP':
+                logger.info(f"⏭️ [VR-Bootstrap-{market}] '{symbol}' ({alias}) 전략은 RUNNING 모드이므로 Bootstrap 매수를 건너뜁니다.")
+                continue
+            is_cycle_day = False # 부트스트랩 매수 시 V값 갱신 방지
+        else:
+            # [ADD] 2. 일반 정규장 개장 배치 호출 시 BOOTSTRAP 모드 전략은 완전 제외 (30분 후 전용 배치에서 처리)
+            if mode == 'BOOTSTRAP':
+                logger.info(f"⏳ [VR-{market}] '{symbol}' ({alias}) 전략은 BOOTSTRAP 빌드업 모드이므로 개장 30분 후 시장가 배치를 대기합니다.")
+                continue
+            is_cycle_day = check_vr_cycle_day(today, freq)
 
         if i > 0:
             logger.info(f"⏳ 다음 전략 실행 전 60초간 대기합니다... ({i+1}/{len(vr_states)})")
@@ -237,7 +250,7 @@ def run_vr_strategies(market: str = "US", check_existing: bool = False, force: b
             logger.info(f"⏭️ [VR-{market}] '{symbol}' ({alias}) 전략이 일시 정지 상태입니다. 건너뜁니다.")
             continue
 
-        logger.info(f"==> [{market}] '{symbol}' ({alias}) VR 전략 처리 시작 (주기: {freq}, 오늘 실행 여부: {is_cycle_day})...")
+        logger.info(f"==> [{market}] '{symbol}' ({alias}) VR 전략 처리 시작 (모드: {mode}, 주기: {freq}, 오늘 사이클 갱신: {is_cycle_day})...")
 
         if broker.get_cash_pool() < 50: # 최소 안전 마진
              send_telegram_message(f"⚠️ <b>[잔고 부족]</b> {symbol} VR 매수를 위한 예수금이 부족합니다. 매도 주문만 시도합니다.")
@@ -318,42 +331,48 @@ def job_update_exchange_rate(broker=None, force=False, is_market_open=False):
     기준: 미국 정규장 시작 시간(09:30 ET)의 환율을 기준으로 하며,
           전날 기준 환율도 전날 미국 정규장 시작 시간의 환율로 비교합니다.
     """
+    import pytz
+    from core.database import (
+        save_exchange_rate_db,
+        get_exchange_rate_by_date_db,
+        get_previous_exchange_rate_db
+    )
     try:
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        cache_key = "USDKRW_MARKET_OPEN_DATE"
-        last_open_date = get_config(cache_key, "")
+        # 미국 동부 시간 기준 오늘 거래일
+        ny_tz = pytz.timezone('America/New_York')
+        today_trade_date = datetime.now(ny_tz).strftime("%Y-%m-%d")
+        now_dt = datetime.now()
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        now_hhmm = now_dt.strftime("%H:%M")
+
+        # 1. 당일 개장 환율이 이미 기록되어 있는지 확인
+        existing_record = get_exchange_rate_by_date_db(today_trade_date)
+        if existing_record and not force:
+            logger.info(
+                f"💵 [ExchangeRate] 미국장 개장 기준 환율이 이미 DB에 보존되어 있습니다: "
+                f"1달러당 {existing_record['rate']:.2f}원 (기준일: {today_trade_date}, 시각: {existing_record.get('recorded_at', '')}). "
+                f"중복 업데이트를 건너뜁니다."
+            )
+            return
 
         if not broker:
             from core.brokers.kiwoom_us import KiwoomUsBroker
             broker = KiwoomUsBroker()
             
-        rate_info = broker.get_exchange_rate(force=force)
+        rate_info = broker.get_exchange_rate(force=True)
         rate = rate_info.get("rate", 0.0)
 
         if rate > 0:
-            # 미국 정규장 개장(09:30 ET) 환율 업데이트 시:
-            # 기존 USDKRW_OPEN_RATE(전일 개장 환율)를 USDKRW_BASE_RATE로 보존하고 오늘 개장 환율을 저장
-            if is_market_open:
-                prev_open_rate_str = get_config("USDKRW_OPEN_RATE", "")
-                if prev_open_rate_str:
-                    set_config("USDKRW_BASE_RATE", prev_open_rate_str)
-                else:
-                    curr_base = get_config("USDKRW_BASE_RATE", "")
-                    if not curr_base:
-                        set_config("USDKRW_BASE_RATE", f"{rate:.2f}")
-                
-                set_config("USDKRW_OPEN_RATE", f"{rate:.2f}")
-                set_config(cache_key, today_str)
-
-            base_rate_str = get_config("USDKRW_BASE_RATE", "")
-            if not base_rate_str:
-                base_rate_str = get_config("USDKRW_OPEN_RATE", f"{rate:.2f}")
-                set_config("USDKRW_BASE_RATE", base_rate_str)
-
-            try:
-                base_rate = float(base_rate_str)
-            except ValueError:
-                base_rate = rate
+            # 직전 거래일 개장 환율 조회
+            prev_record = get_previous_exchange_rate_db(today_trade_date)
+            if prev_record and prev_record.get("rate", 0) > 0:
+                base_rate = prev_record["rate"]
+            else:
+                base_rate_str = get_config("USDKRW_BASE_RATE", "")
+                try:
+                    base_rate = float(base_rate_str) if base_rate_str else rate
+                except ValueError:
+                    base_rate = rate
 
             if base_rate > 0:
                 diff = rate - base_rate
@@ -362,25 +381,42 @@ def job_update_exchange_rate(broker=None, force=False, is_market_open=False):
                 diff = 0.0
                 pct = 0.0
 
+            source = rate_info.get("source", "KIWOOM")
+
+            # 1) exchange_rates 테이블에 영구 저장
+            save_exchange_rate_db(
+                trade_date=today_trade_date,
+                recorded_at=now_str,
+                rate=rate,
+                base_rate=base_rate,
+                diff=diff,
+                pct=pct,
+                source=source
+            )
+
+            # 2) 기존 하위 호환 config 테이블 저장
             set_config("USDKRW", f"{rate:.2f}")
-            set_config("USDKRW_UPDATE_DATE", today_str)
-            set_config("USDKRW_UPDATE_TIME", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            
+            set_config("USDKRW_BASE_RATE", f"{base_rate:.2f}")
+            set_config("USDKRW_OPEN_RATE", f"{rate:.2f}")
+            set_config("USDKRW_UPDATE_DATE", today_trade_date)
+            set_config("USDKRW_UPDATE_TIME", f"{now_str} ({now_hhmm})")
             set_config("USDKRW_DIFF", f"{diff:.2f}")
             set_config("USDKRW_PCT", f"{pct:.2f}")
+            set_config("USDKRW_MARKET_OPEN_DATE", today_trade_date)
             
-            label_desc = "미국 정규장 개장 기준 (09:30 ET)" if is_market_open else "실시간 환율 조회"
-            logger.info(f"💵 [ExchangeRate] 키움 환율 업데이트 완료: 1$ = ₩{rate:,.2f} (전일 개장 기준: ₩{base_rate:,.2f}, 전일대비 {diff:+.2f}원, {pct:+.2f}%)")
+            label_desc = f"미국 정규장 개장 기준 (09:30 ET / {now_hhmm} KST)" if is_market_open else f"환율 업데이트 ({now_hhmm} KST)"
+            logger.info(f"💵 [ExchangeRate] 키움 환율 업데이트 완료: 1$ = ₩{rate:,.2f} (전일 개장 기준: ₩{base_rate:,.2f}, 전일대비 {diff:+.2f}원, {pct:+.2f}%) [{source}]")
             
             if is_market_open or force:
                 send_telegram_message(
                     f"💵 <b>[고시환율 업데이트 완료]</b>\n"
                     f"구분: {label_desc}\n"
-                    f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"고시 환율: 1$ = <b>₩{rate:,.2f}</b> (전일 개장대비 {diff:+.2f}원, {pct:+.2f}%)"
+                    f"기준일: {today_trade_date} ({now_hhmm})\n"
+                    f"고시 환율: 1$ = <b>₩{rate:,.2f}</b> (전일 개장대비 {diff:+.2f}원, {pct:+.2f}%)\n"
+                    f"전일 개장 환율: ₩{base_rate:,.2f} (출처: {source})"
                 )
         else:
-            logger.warning("⚠️ [ExchangeRate] 키움 환율 API 응답에서 고시환율을 가져오지 못했습니다.")
+            logger.warning("⚠️ [ExchangeRate] 환율 API 응답에서 고시환율을 가져오지 못했습니다.")
     except Exception as e:
         logger.error(f"환율 업데이트 중 오류 발생: {e}")
 

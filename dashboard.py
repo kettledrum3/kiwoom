@@ -161,11 +161,78 @@ from dotenv import load_dotenv, set_key
 from core.cavr import CAConfig, CAState, CostAveragingEngine, VRConfig, VRState, ValueRebalancingEngine
 from core.backtest import run_backtest
 from core.fetch_data import update_ticker_data
-from core.auth import update_user_email, generate_otp, verify_otp, check_login, register_user, update_password, reset_password_request
+from core.auth import (
+    update_user_email, generate_otp, verify_otp, check_login, register_user, update_password, reset_password_request,
+    save_ip_session, get_ip_session, clear_ip_session
+)
 from core.notifier import send_telegram_message
 from core.scheduler import run_ca_strategies, run_vr_strategies, job_update_exchange_rate # 스케줄러 로직 직접 호출을 위해 임포트
+from core.database import get_exchange_rate_history_db
 import glob
 import json
+
+def get_client_ip() -> str:
+    """Streamlit 요청 헤더 또는 런타임에서 접속 클라이언트 IP 추출"""
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "headers"):
+            headers = st.context.headers
+            if headers:
+                fwd = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
+                if fwd:
+                    return fwd.split(",")[0].strip()
+                remote = headers.get("remote-addr") or headers.get("Remote-Addr")
+                if remote:
+                    return remote.strip()
+    except Exception:
+        pass
+
+    try:
+        from streamlit.web.server.websocket_headers import _get_websocket_headers
+        headers = _get_websocket_headers()
+        if headers:
+            fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+            if fwd:
+                return fwd.split(",")[0].strip()
+            remote = headers.get("Remote-Addr") or headers.get("remote-addr")
+            if remote:
+                return remote.strip()
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+# 동일 IP 기반 자동 로그인 체크 (대시보드 재실행 시 로그인 유지)
+_client_ip = get_client_ip()
+if not st.session_state.authenticated and not st.session_state.temp_pass_mode:
+    _saved_ip_session = get_ip_session(_client_ip)
+    if _saved_ip_session:
+        st.session_state.authenticated = True
+        st.session_state.user_email = _saved_ip_session["email"]
+        st.session_state.username = _saved_ip_session["username"]
+        st.session_state.remembered_username = _saved_ip_session["username"]
+        st.session_state.last_activity = time.time()
+        st.session_state.auth_trace.append(f"Auto-login via IP: {_client_ip} ({_saved_ip_session['username']})")
+
+        # UI 설정 복원
+        l_market, l_symbol, l_alias = load_ui_settings_db(_saved_ip_session["email"])
+        kr_now = datetime.now(pytz.timezone('Asia/Seoul'))
+        kr_opnd_yn = get_config("kr_market_opnd_yn", "Y")
+        us_opnd_yn = get_config("us_market_opnd_yn", "Y")
+        
+        selected_market_for_session = None
+        if 8 <= kr_now.hour < 17 and kr_opnd_yn == "Y":
+            selected_market_for_session = "한국 시장"
+        elif us_opnd_yn == "Y":
+            selected_market_for_session = "미국 시장"
+        if not selected_market_for_session:
+            selected_market_for_session = l_market if l_market else "미국 시장"
+            
+        if "market_selector" not in st.session_state:
+            st.session_state["market_selector"] = selected_market_for_session
+        if l_symbol and "last_loaded_symbol" not in st.session_state:
+            st.session_state["last_loaded_symbol"] = l_symbol
+        if l_alias and "last_loaded_alias" not in st.session_state:
+            st.session_state["last_loaded_alias"] = l_alias
 
 # KIS 주문 유형 코드 매핑 (cavr.py와 동일하게 유지)
 ORDER_TYPE_MAP = {
@@ -232,6 +299,10 @@ if not st.session_state.authenticated:
                         st.session_state.user_email = res["email"]
                         st.session_state.username = res["username"]
                         st.session_state.last_activity = time.time() # 세션 시작 시간 설정
+                        
+                        # [ADD] 클라이언트 IP 기반 세션 저장 (대시보드 재실행 시 자동 로그인 유지)
+                        save_ip_session(get_client_ip(), res["username"], res["email"])
+
                         send_telegram_message(f"🔓 <b>{res['username']}</b>님이 대시보드에 접속했습니다.")
                         
                         # [UI 복원 로직 추가]
@@ -313,6 +384,7 @@ st.session_state.auth_trace.append("Authentication Passed - Starting Main App")
 
 # 로그아웃 버튼 (사이드바 하단용 미리 정의)
 def handle_logout():
+    clear_ip_session(get_client_ip())
     st.session_state.authenticated = False
     st.rerun()
 
@@ -797,20 +869,34 @@ with st.sidebar:
                 t_rate = st.number_input("매도 세금 (%)", value=0.20, step=0.01, format="%.4f", key=f"{m_lower}_{widget_suffix}_bt_tax") / 100.0
         
         if s_choice == "CA":
-            # [CA 전용] 전략 할당 예수금만 표시
+            # [CA 전용] 전략 할당 예수금
             def_pool = d_state.get('pool', 0.0) if d_state else 0.0
             s_pool = st.number_input(f"전략 할당 예수금 ({m_curr})", value=float(def_pool), key=f"{m_lower}_{widget_suffix}_pool", help="이 전략에서 사용할 현금 한도입니다.")
 
-            def_ub = d_state.get('unit_buy_amount', 250.0) if d_state else 250.0
             def_a = d_state.get('a_default', 40) if d_state else 40
             def_tp_val = d_state.get('target_profit_pct', 0.07 if m_code == "KR" else 0.10) if d_state else (0.07 if m_code == "KR" else 0.10)
             def_qs = d_state.get('use_quarter_stop', True) if d_state else True
             def_ver = d_state.get('version', "V2.2") if d_state else "V2.2"
             
             s_ver = st.radio("버전 선택", ["V2.2", "V4.0"], index=0 if def_ver == "V2.2" else 1, horizontal=True, key=f"{m_lower}_{widget_suffix}_ca_ver")
-            u_buy = st.number_input(f"1회 매수 금액 ({m_curr})", value=float(def_ub), key=f"{m_lower}_{widget_suffix}_ca_ub")
-            t_profit = st.slider("목표 수익 (%)", 5, 30, int(def_tp_val * 100), key=f"{m_lower}_{widget_suffix}_ca_tp") / 100.0
+            
+            # 1. 분할 횟수 (a) 설정 (위로 이동)
             a_val = st.number_input("분할 횟수 (a)", 20, 60, int(def_a), key=f"{m_lower}_{widget_suffix}_ca_a")
+            
+            # 2. 1회 매수 금액 자동 계산 (전략 할당 예수금 / 분할 횟수)
+            if s_pool > 0 and a_val > 0:
+                calc_ub = round(s_pool / a_val, 2) if m_code == "US" else float(int(s_pool / a_val))
+            else:
+                calc_ub = d_state.get('unit_buy_amount', 250.0) if d_state else 250.0
+            
+            u_buy = st.number_input(
+                f"1회 매수 금액 ({m_curr})", 
+                value=float(calc_ub), 
+                key=f"{m_lower}_{widget_suffix}_ca_ub",
+                help=f"전략할당예수금({s_pool:,.2f})을 분할횟수({a_val})로 나눈 1회 매수금액입니다."
+            )
+            
+            t_profit = st.slider("목표 수익 (%)", 5, 30, int(def_tp_val * 100), key=f"{m_lower}_{widget_suffix}_ca_tp") / 100.0
             q_stop = st.checkbox("쿼터 손절 사용", value=def_qs, key=f"{m_lower}_{widget_suffix}_ca_qs")
             
             return {
@@ -1337,7 +1423,7 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
         help_text = "설정된 전체 운용 자본금(initial_budget)입니다."
     else:
         display_val = s_pool
-        label_name = f"💰 전략 할당 예수금 ({currency_symbol})"
+        label_name = f"💰 전략 가용 예수금 ({currency_symbol})"
         help_text = "설정된 전체 예수금에서 현재 투입액을 차감한 실시간 가용 예수금(s_pool)입니다."
 
     col_p1.metric(label=label_name, value=f"{currency_symbol}{format_currency(display_val, market_code)}", help=help_text)
@@ -1571,48 +1657,64 @@ with tab_analysis:
                 fig_strat = go.Figure(data=[go.Pie(labels=df_strat['strategy'], values=df_strat['realized_profit'], hole=.3)])
                 st.plotly_chart(fig_strat, width='stretch')
 
-            # [신규] 환율 변동 추이 그래프
-            st.divider()
-            st.subheader("💹 환율 변동 추이 (USD/KRW)")
-            try:
-                # 분석 기간에 맞춰 환율 이력 조회 (기본 최근 30일)
-                end_dt = datetime.now().strftime("%Y%m%d")
-                start_dt = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+def render_exchange_rate_expander(market_code: str = "US", key_suffix: str = ""):
+    """미국 환율(USD/KRW) 일별 변동 추이 expander 렌더링"""
+    if market_code != "US":
+        return
+    with st.expander("💹 미국 환율(USD/KRW) 일별 변동 추이", expanded=False):
+        try:
+            history = get_exchange_rate_history_db(days=60)
+            if history:
+                df_ex = pd.DataFrame(history)
+                df_ex['trade_date_dt'] = pd.to_datetime(df_ex['trade_date'])
+                df_ex = df_ex.sort_values('trade_date_dt')
+
+                # 상단 최신 요약
+                latest = history[-1]
+                rec_time_str = latest.get("recorded_at", "")
+                hhmm = rec_time_str[11:16] if len(rec_time_str) >= 16 else ""
+                time_disp = f" ({hhmm} KST)" if hhmm else ""
                 
-                # ActiveBroker가 US가 아닐 수 있으므로 명시적 생성 또는 확인
-                # 세션 상태 캐싱 (1시간)
-                ex_history_key = f"ex_history_{market_code}"
-                last_ex_history_time_key = f"last_ex_history_time_{market_code}"
-                now_ts = time.time()
-                
-                if ex_history_key not in st.session_state or now_ts - st.session_state.get(last_ex_history_time_key, 0) > 3600:
-                    hist_broker = ActiveBroker if market_code == "US" else get_active_broker_instance("US")
-                    ex_history = hist_broker.get_exchange_rate_history(start_dt, end_dt)
-                    st.session_state[ex_history_key] = ex_history
-                    st.session_state[last_ex_history_time_key] = now_ts
-                else:
-                    ex_history = st.session_state[ex_history_key]
-                
-                if ex_history:
-                    df_ex = pd.DataFrame(ex_history)
-                    df_ex['date'] = pd.to_datetime(df_ex['date'])
-                    df_ex = df_ex.sort_values('date')
-                    
-                    fig_ex = go.Figure()
-                    fig_ex.add_trace(go.Scatter(
-                        x=df_ex['date'], y=df_ex['rate'],
-                        mode='lines+markers',
-                        name='USD/KRW',
-                        line=dict(color='mediumseagreen', width=2)
-                    ))
-                    fig_ex.update_layout(
-                        title="최근 환율 변동 추이 (키움 제공)",
-                        xaxis_title="날짜", yaxis_title="환율 (₩)",
-                        hovermode="x unified"
-                    )
-                    st.plotly_chart(fig_ex, width='stretch')
-            except Exception as e:
-                st.caption(f"환율 추이를 불러올 수 없습니다: {e}")
+                c_sum1, c_sum2, c_sum3 = st.columns([1.5, 1.5, 2])
+                c_sum1.metric("최근 개장 환율", f"₩{latest['rate']:,.2f}", f"{latest['diff']:+.2f}원 ({latest['pct']:+.2f}%)")
+                c_sum2.metric("기준일", f"{latest['trade_date']}{time_disp}")
+                c_sum3.caption(f"출처: {latest.get('source', 'KIWOOM')} | 전일 개장 환율: ₩{latest['base_rate']:,.2f}")
+
+                # Plotly 인터랙티브 라인 차트
+                fig_ex = go.Figure()
+                fig_ex.add_trace(go.Scatter(
+                    x=df_ex['trade_date'],
+                    y=df_ex['rate'],
+                    mode='lines+markers',
+                    name='USD/KRW 개장 환율',
+                    line=dict(color='#2E7D32', width=2.5),
+                    marker=dict(size=6, color='#1B5E20'),
+                    customdata=df_ex[['diff', 'pct', 'recorded_at', 'source']],
+                    hovertemplate="<b>거래일: %{x}</b><br>환율: ₩%{y:,.2f}<br>전일대비: %{customdata[0]:+.2f}원 (%{customdata[1]:+.2f}%)<br>기록시각: %{customdata[2]}<br>출처: %{customdata[3]}<extra></extra>"
+                ))
+                fig_ex.update_layout(
+                    title="미국 정규장 개장(09:30 ET) 기준 USD/KRW 일별 환율 추이",
+                    xaxis_title="거래일",
+                    yaxis_title="환율 (₩)",
+                    hovermode="x unified",
+                    margin=dict(l=40, r=40, t=40, b=40),
+                    height=350
+                )
+                st.plotly_chart(fig_ex, width='stretch', key=f"plotly_fx_chart_{key_suffix}" if key_suffix else None)
+
+                # 최근 상세 테이블
+                with st.expander("📋 일별 개장 환율 상세 기록 (최근순)", expanded=False):
+                    df_table = pd.DataFrame(reversed(history))
+                    df_table = df_table[['trade_date', 'rate', 'base_rate', 'diff', 'pct', 'recorded_at', 'source']]
+                    df_table.columns = ['미국 거래일', '개장 환율(₩)', '전일 개장 환율(₩)', '변동(원)', '등락률(%)', '기록 일시(KST)', '출처']
+                    st.dataframe(df_table, width='stretch', hide_index=True)
+            else:
+                st.info("ℹ️ DB에 저장된 일별 환율 기록이 없습니다. 미국장 개장 시 자동으로 기록됩니다.")
+        except Exception as e:
+            st.caption(f"환율 추이를 불러올 수 없습니다: {e}")
+
+            # [신규] 환율 변동 추이 그래프 (Expander)
+            render_exchange_rate_expander(market_code=market_code, key_suffix="analysis")
 
 with tab_us:
     render_market_tab("US")
@@ -1930,11 +2032,24 @@ def display_realtime_header():
                     col2.metric(label="환율 (정규장 개장 09:30 ET 기준)", value=f"₩{usd_krw:,.2f}", delta=delta_fx)
                     with col2:
                         st.caption(f"기준: 전일 개장 대비 | {fx_time}")
-                        if st.button("🔄 지금 환율 조회", key="manual_fx_update", help="환율 정보를 즉시 갱신합니다."):
-                            job_update_exchange_rate(broker=ActiveBroker, force=True)
+                        if st.button("🔄 지금 환율 조회", key="manual_fx_update", help="현재 실시간 환율을 조회하여 임시 표시합니다. (공식 개장 환율 DB 미변경)"):
+                            with st.spinner("실시간 환율 조회 중..."):
+                                live_info = ActiveBroker.get_exchange_rate(force=True)
+                                st.session_state["manual_live_fx"] = {
+                                    "rate": live_info.get("rate", 0.0),
+                                    "time": datetime.now().strftime("%H:%M:%S"),
+                                    "source": live_info.get("source", "KIWOOM")
+                                }
                             st.rerun()
                     col3.write("") # 간격
                     col4.caption(f"⏱️ [{market_code}] 실시간 자동 갱신 중 (10초) | {datetime.now().strftime('%H:%M:%S')}")
+                    
+                    if "manual_live_fx" in st.session_state and st.session_state["manual_live_fx"].get("rate", 0) > 0:
+                        lfx = st.session_state["manual_live_fx"]
+                        st.info(f"🔍 **실시간 환율 (임시 조회)**: 1$ = **₩{lfx['rate']:,.2f}** (조회 시각: {lfx['time']}, 출처: {lfx['source']}) — *공식 개장 환율 DB는 변경되지 않습니다.*")
+
+                    # [신규] 환율 변동 추이 그래프 (Expander)
+                    render_exchange_rate_expander(market_code="US", key_suffix="live_header")
                 else:
                     col1, col2, col3 = st.columns([1, 1, 2])
                     col1.metric(label=f"현재가 ({format_ticker_display(symbol, market_code)})", value=f"{currency_symbol}{format_currency(price, market_code)}", delta=delta_val)
