@@ -485,7 +485,17 @@ def job_vr_bootstrap_market_buys(market: str = "US"):
     if market == "US" and get_config("us_market_opnd_yn") == "N":
         return
 
-    logger.info(f"🔔 [{market}] 정규장 시작 30분 후 VR Bootstrap 시장가 매수를 시작합니다.")
+    # [ADD] 실행 전 BOOTSTRAP 모드인 활성 전략이 있는지 먼저 확인
+    vr_states = get_all_states_db("VR", market=market)
+    bootstrap_strategies = [
+        st for st in vr_states 
+        if st.get('is_active', True) and st.get('mode') == 'BOOTSTRAP'
+    ]
+    if not bootstrap_strategies:
+        logger.debug(f"ℹ️ [VR-Bootstrap-{market}] BOOTSTRAP 모드인 활성 전략이 없어 작업을 건너뜁니다.")
+        return
+
+    logger.info(f"🔔 [{market}] 정규장 시작 30분 후 VR Bootstrap 시장가 매수를 시작합니다. (대상 전략: {len(bootstrap_strategies)}개)")
     
     broker = KiwoomKrBroker() if market == "KR" else KiwoomUsBroker()
     try:

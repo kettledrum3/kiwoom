@@ -83,15 +83,15 @@ class KiwoomUsBroker(Broker):
                 
                 # 토큰 만료 대응 (401 Unauthorized)
                 if res.status_code == 401:
-                    logger.warning(f"⚠️ [US API] 토큰 만료 감지. 재발급 및 재시도 ({attempt+1}/{max_retries})")
+                    logger.warning(f"⚠️ [US API] 토큰 만료 감지 (401). 재발급 및 재시도 ({attempt+1}/{max_retries})")
                     invalidate_access_token_controlled(market="US", account_no=self.account_no, trade_mode=self.trade_mode)
                     time.sleep(1.0)
                     continue
                 
-                # 서버 에러 대응 (500)
-                if res.status_code == 500:
-                    logger.warning(f"⚠️ [US API] Kiwoom 서버 에러(500). 1초 대기 후 재시도 ({attempt+1}/{max_retries})")
-                    time.sleep(1.0)
+                # 서버 에러 (500) 및 호출 제한 (429 Too Many Requests, 403 Forbidden Rate Limit)
+                if res.status_code in [429, 403, 500]:
+                    logger.warning(f"⚠️ [US API] Kiwoom 서버 일시 오류/호출제한 ({res.status_code}). 1.5초 대기 후 재시도 ({attempt+1}/{max_retries})")
+                    time.sleep(1.5)
                     continue
 
                 # 토큰 비즈니스 에러 대응 (200 OK 내 에러 메시지 감지)
@@ -272,31 +272,34 @@ class KiwoomUsBroker(Broker):
                     pass
 
         # 1순위: 키움증권 ust31301 API를 최우선으로 사용하여 환율 조회
-        logger.info(f"[ExchangeRate] 키움증권 ust31301 API를 사용하여 환율을 조회합니다.")
+        logger.info(f"[ExchangeRate] 키움증권 ust31301 API를 사용하여 환율을 조회합니다. (모드: {self.trade_mode})")
         try:
             url = f"{self.base_url}/api/us/exchange"
             body = {
                 "exch_tp": "2" # 2: 달러(USD) -> 원화(KRW) 환율
             }
             res = self._call_api("POST", url, "ust31301", data=json.dumps(body))
-            if res:
-                data = res.json()
-                if data.get('return_code') == 0:
-                    rate = float(data.get('aplc_exrt', 0))
-                    if rate > 0:
-                        logger.info(f"💵 [ExchangeRate] 키움증권 API 환율 조회 성공: 1달러당 {rate:.2f}원")
-                        res_dict = {
-                            "rate": rate,
-                            "diff": 0.0,
-                            "pct": 0.0,
-                            "source": "KIWOOM"
-                        }
-                        self._exchange_rate_cache = (today_str, res_dict)
-                        return res_dict
+            if res is not None:
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get('return_code') == 0:
+                        rate = float(data.get('aplc_exrt', 0))
+                        if rate > 0:
+                            logger.info(f"💵 [ExchangeRate] 키움증권 API 환율 조회 성공: 1달러당 {rate:.2f}원")
+                            res_dict = {
+                                "rate": rate,
+                                "diff": 0.0,
+                                "pct": 0.0,
+                                "source": "KIWOOM"
+                            }
+                            self._exchange_rate_cache = (today_str, res_dict)
+                            return res_dict
+                        else:
+                            logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 응답에서 환율 값이 0 이하입니다: {data}")
                     else:
-                        logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 응답에서 환율 값이 0 이하입니다: {data}")
+                        logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 오류: [{data.get('return_code')}]({data.get('return_msg', '알 수 없는 오류')})")
                 else:
-                    logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 오류: {data.get('return_msg', '알 수 없는 오류')}")
+                    logger.warning(f"⚠️ [ExchangeRate] 키움증권 API HTTP 에러 ({res.status_code}): {res.text}")
         except Exception as e:
             logger.warning(f"⚠️ [ExchangeRate] 키움증권 API 환율 조회 중 오류 발생: {e}")
 
@@ -490,12 +493,18 @@ class KiwoomUsBroker(Broker):
 
         try:
             res = self._call_api("POST", url, tr_id, data=json.dumps(body))
-            if not res:
+            if res is None:
                 logger.error(f"❌ [US API Debug] API 호출 결과가 None입니다. (네트워크/인증 오류 가능성)")
                 return False
             
             logger.info(f"🔍 [US API Debug] API 응답 코드: {res.status_code}, 본문: {res.text}")
             
+            if res.status_code != 200:
+                logger.error(f"🔴 [US 주문 HTTP 에러] {strategy} {action} {symbol} {qty}주 @ {price} -> HTTP {res.status_code}: {res.text}")
+                log_order_db(symbol, strategy, action, price, qty, trde_tp, "FAILED", "", f"HTTP {res.status_code}", market="US", strategy_name=strategy_name)
+                send_telegram_message(f"🔴 <b>[US 주문 HTTP 에러]</b>\n종목: {symbol}\n유형: {action}\n사유: HTTP {res.status_code}")
+                return False
+
             data = res.json()
             if data.get('return_code') == 0:
                 odno = data.get('ord_no')

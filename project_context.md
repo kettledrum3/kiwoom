@@ -600,7 +600,8 @@
     - [core/scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py): 미국 정규장 개장 시각(서머타임 22:30 / 표준 23:30 KST)에 환율을 저장하며, 당일 이미 기록이 존재할 경우 중복 저장 및 알림 발송을 건너뛰도록 차단. 직전 거래일의 개장 환율을 DB에서 안전하게 가져와 전일 대비 변동폭(`diff`)과 등락률(`pct`)을 정확히 산출.
 *   **대시보드 실시간 환율 조회 격리 및 일별 환율 Plotly 차트 제공**:
     - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): "🔄 지금 환율 조회" 버튼 클릭 시 DB에 기록을 덮어쓰지 않고 `st.session_state`를 통해 화면에만 임시 배너로 표시하도록 분리.
-    - 분석 탭 하단에 `render_exchange_rate_expander`를 추가하여 일별 정규장 개장 환율 변동 그래프(Plotly)와 상세 이력 테이블을 제공.
+    - 분석 탭 하단 및 실시간 시세 헤더 영역에 `render_exchange_rate_expander`를 추가하여 일별 정규장 개장 환율 변동 그래프(Plotly)와 상세 이력 테이블을 제공.
+    - **미국 시장 운영 시간 외(`not is_active`)라도 환율 메트릭, 임시 실시간 환율 조회 버튼, 일별 환율 그래프(Expander)가 상시 표시**되도록 개선.
 
 ### 📅 2026-08-23 (VR 부트스트랩과 RUNNING 모드 스케줄 완전 분리 및 V값 재계산 방어)
 *   **`RUNNING` 모드와 `BOOTSTRAP` 모드의 배치 실행 상호 배타적 분리**:
@@ -629,3 +630,25 @@
     - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 잔고가 0이 되어 다음 차수(예: SOXL_2차 $\rightarrow$ SOXL_3차)로 전환될 때, 직전 차수에서 실현된 수익금을 이전 예산에 합산하여 새 차수 예산을 산정하고 1회 매수금을 복리로 자동 산출 ($\text{새 예산} = \text{직전 예산} + \text{실현 수익금}$, $\text{새 1회 매수금} = \text{새 예산} / a$).
 *   **주문번호(`odno`) 기반 체결 동기화 및 전략 독립성 보장**:
     - [core/database.py](file:///d:/Python_D/kiwoom/core/database.py): 주문 제출 즉시 고유 주문번호(`odno`)와 `strategy_name`을 `order_history`에 선기록하고, 거래소 체결 동기화(`sync_trade_history_db`) 시 `odno`를 1순위로 조회하여 해당 주문을 발행한 특정 전략/차수에만 체결 내역과 평단가, 잔고를 100% 독립 귀속. 타 차수 및 타 종목 간 데이터 간섭 원천 차단.
+
+### 📅 2026-08-24 (VR 실시간 전략 업데이트 Pool 사용한도 버그 수정 및 사이드바 UI 동선 최적화)
+*   **VR 전략 수정 시 `pool_limit_pct` 미반영 버그 해결**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 사이드바 `전략 업데이트` 실행 시 `state_obj.pool_limit_pct = vr_pool_limit_pct` 대입이 누락되어 기존 상태값(50%)이 유지되던 결함을 수정하여, 사용자가 슬라이더로 조정한 풀 사용한도(예: 75%)가 DB에 정상 저장 및 반영되도록 조치.
+*   **사이드바 핵심 조작 버튼 위치 재배치 및 동선 개선**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 전략 생성(`💾 신규전략 저장 및 실행`), 불러오기(`📂 저장된 전략 불러오기`), 수정(`✏️ 전략 업데이트`) 버튼을 `전략 설정` 섹션 바로 아래로 이동하여 설정 직후 원클릭으로 조작할 수 있도록 동선 최적화.
+*   **사이드바 중복/불필요 기능 제거 및 대시보드 카드 연동 일원화**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 대시보드 전략 상세 내역(확장 카드)에 이미 구현되어 있는 `📝 이름 변경`, `🗑️ 전략 영구 삭제` 기능으로 일원화하고 사이드바의 중복 버튼 및 이름변경 모드 체크박스를 제거하여 사이드바 간소화.
+*   **로그아웃 버튼 위치 상단 이동**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 사이드바 최하단에 있던 `🔓 로그아웃` 버튼을 사이드바 상단의 로그인 사용자 이름(`👤 **username**님 환영합니다.`) 바로 아래로 이동.
+
+### 📅 2026-08-27 (미국장 개장 로그 분석 기반 시스템 안정성 및 주문 조건표 기준 고정)
+*   **스케줄러 VR Bootstrap 사전 검사 및 불필요한 로그 개선**:
+    - [core/scheduler.py](file:///d:/Python_D/kiwoom/core/scheduler.py): `job_vr_bootstrap_market_buys` 시작 시점에 DB에서 활성화된 `mode == 'BOOTSTRAP'` 전략이 있는지 먼저 검사하여, 대상 전략이 없는 경우 불필요한 시장가 매수 안내 메시지/로그 출력을 건너뛰어 사용자 혼동을 방지.
+*   **키움 모의투자(MOCK) 환경 환율 조회 로그 명확화**:
+    - [core/brokers/kiwoom_us.py](file:///d:/Python_D/kiwoom/core/brokers/kiwoom_us.py): 키움 모의투자 환경에서 환율 조회 TR(`ust31301`) 미지원에 따른 Fallback(`Exchangerate.host`) 전환 안내 로그를 명확히 출력.
+*   **API Response Boolean 평가 버그 수정 및 주문 전송 안정화**:
+    - [core/brokers/kiwoom_us.py](file:///d:/Python_D/kiwoom/core/brokers/kiwoom_us.py): `requests.Response` 객체가 HTTP 4xx(403/429 등)일 때 `bool(res) == False`로 평가되어 `None`으로 오판단되던 버그를 `if res is None:`으로 수정하고 HTTP 상태 코드 및 본문 상세 로깅 추가. `_call_api`에 Rate Limit(429/403) 발생 시 1.5초 대기 후 자동 재시도 로직 추가.
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `place_daily_limit_orders`의 주문 간 딜레이를 `time.sleep(0.2)`에서 `time.sleep(0.5)`로 상향하여 초당 주문 호출 제한(Rate Limit)을 원천 차단.
+*   **VR 당일 발주 기준값 보존 및 대시보드 주문 조건표 고정 표시**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `VRState`에 `cycle_start_shares` 필드를 추가하고, 당일 주문 제출 시점의 기준 주수(`cycle_start_shares`), Pool(`cycle_start_pool`), 목표 밸류(`cycle_V`)를 보존.
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 대시보드의 '🛒 예약 주문 가이드'가 장중 체결로 인한 실시간 잔고로 변동되지 않고, **당일 주문 시점의 기준값(`cycle_V`, `cycle_start_pool`, `cycle_start_shares`, `last_order_date`)을 바탕으로 조건표를 표시**하고 상단에 산출 기준 상태 및 날짜 메타데이터를 명시하도록 개선 (텔레그램 접수 내역과 100% 일치).

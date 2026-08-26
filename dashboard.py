@@ -608,6 +608,8 @@ def display_sidebar_summary(m_display, m_code):
 with st.sidebar:
     st.title("🚀 키움CAVR 컨트롤 패널")
     st.write(f"👤 **{st.session_state.get('username', 'Investor')}**님 환영합니다.")
+    if st.button("🔓 로그아웃", key="sidebar_top_logout_btn", width='stretch'):
+        handle_logout()
     
     st.write("### 🎛️ 시스템 운영 설정")
     with st.container(border=True):
@@ -1003,50 +1005,20 @@ with st.sidebar:
         vr_invest_type_disp = active_settings["invest_type_disp"]
         vr_include_existing = active_settings.get("include_existing", False)
         vr_bootstrap_days = active_settings.get("bootstrap_days", 10)
+        vr_pool_limit_pct = active_settings.get("pool_limit_pct", 50.0)
 
     st.divider()
 
-    # 스케줄러 제어 및 요약 정보 호출
-    display_scheduler_control()
-    display_sidebar_summary(active_market_display, market_code)
-
-    st.divider()
-    # [요청] 전략 관리 버튼 구성
+    # [요청] 전략 관리 버튼 구성 (전략 설정 바로 아래 배치)
     col_b1, col_b2 = st.columns(2)
     save_run_btn = col_b1.button("💾 신규전략 저장 및 실행", width='stretch', type="primary")
     load_strategy_btn = col_b2.button("📂 저장된 전략 불러오기", width='stretch')
-    
-    col_b3, col_b4 = st.columns(2)
-    update_strategy_btn = col_b3.button("✏️ 전략 업데이트", width='stretch')
-    delete_strategy_btn = col_b4.button("🗑️ 전략 삭제", width='stretch')
+    update_strategy_btn = st.button("✏️ 전략 업데이트", width='stretch')
 
     if load_strategy_btn:
         st.sidebar.info("🔄 최신 전략 데이터를 로드합니다.")
         time.sleep(0.5)
         st.rerun()
-
-    # --- 전략 관리 버튼 로직 수정 ---
-    # 전략 이름 변경 버튼 로직
-    if strategy_alias and strategy_alias != "--- 신규 입력 ---":
-        st.sidebar.markdown("---")
-        if st.sidebar.checkbox("📝 전략 이름 변경 모드 활성화", key="rename_mode_toggle"):
-            st.sidebar.subheader("전략 이름 변경")
-            new_alias_input = st.sidebar.text_input("새 전략 별칭 입력", value=strategy_alias, key="new_alias_for_rename")
-            rename_strategy_confirm_btn = st.sidebar.button("🚀 변경 확정", width='stretch')
-
-            if 'rename_strategy_confirm_btn' in locals() and rename_strategy_confirm_btn:
-                if not new_alias_input or new_alias_input == "--- 신규 입력 ---":
-                    st.sidebar.error("유효한 새 전략 별칭을 입력해주세요.")
-                elif new_alias_input == strategy_alias:
-                    st.sidebar.info("기존 별칭과 동일합니다. 변경할 필요가 없습니다.")
-                else:
-                    success, msg = rename_strategy_db(symbol, strategy_choice, market_code, strategy_alias, new_alias_input)
-                    if success:
-                        st.sidebar.success(msg)
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.sidebar.error(msg)
 
     if save_run_btn:
         if mode == "실전 투자":
@@ -1203,6 +1175,7 @@ with st.sidebar:
                     state_obj.band_high_pct = 100.0 + vr_band_pct
                     state_obj.freq = vr_freq
                     state_obj.investment_type = vr_investment_type
+                    state_obj.pool_limit_pct = vr_pool_limit_pct
                                     
                 save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
                 st.sidebar.success(f"✅ '{strategy_alias}' 전략이 업데이트되었습니다.")
@@ -1212,32 +1185,12 @@ with st.sidebar:
                 st.sidebar.warning("업데이트할 기존 전략을 찾을 수 없습니다. '새 전략 저장'을 이용하세요.")
         else:
             st.sidebar.warning("백테스트 모드에서는 전략을 업데이트할 수 없습니다.")
-    if delete_strategy_btn:
-        if st.sidebar.button("정말 삭제하시겠습니까?", key="confirm_delete_btn"):
-            delete_strategy_db(symbol, strategy_choice, market=market_code, strategy_name=strategy_alias)
-            st.sidebar.success(f"🗑️ '{strategy_alias}' 전략이 삭제되었습니다.")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.sidebar.warning("🗑️ '전략 삭제' 버튼을 다시 누르면 영구 삭제됩니다. (취소하려면 다른 버튼 클릭)")
 
-    # '취소' 버튼은 별도로 구현하지 않고, 다른 버튼을 누르거나 새로고침하는 것으로 대체
-    # if cancel_action:
-    #     st.sidebar.info("✖️ '취소'되었습니다. (현재는 새로고침과 동일)")
-    #     time.sleep(0.5)
-    #     st.rerun()
+    st.divider()
 
-
-# --- Sidebar ---
-# 사이드바 상태 요약 표시 함수
-# [중복 제거] 정의는 상단에 이미 존재하므로 삭제
-
-# --- Main Content ---
-# [중복 제거] 인증 섹션은 이미 최상단으로 이동함
-
-# 로그아웃 버튼 (사이드바 하단)
-if st.sidebar.button("🔓 로그아웃"):
-    handle_logout()
+    # 스케줄러 제어 및 요약 정보 호출
+    display_scheduler_control()
+    display_sidebar_summary(active_market_display, market_code)
 
 display_mode = "모의 투자" if (current_trade_mode == "MOCK" and mode == "실전 투자") else mode
 st.title(f"🚀 {display_mode} - {strategy_choice} 전략")
@@ -2000,6 +1953,38 @@ def display_realtime_header():
         is_active, now = check_market_active(market_code)
         if not is_active:
             st.info(f"😴 {market_code} 시장 운영 시간 외입니다. ({now.strftime('%H:%M')})")
+            
+            # [ADD] 미국 시장인 경우 운영 시간 외라도 환율 메트릭 및 환율 그래프 표시
+            if market_code == "US":
+                usd_krw = float(get_config("USDKRW", "0.00"))
+                usd_diff = float(get_config("USDKRW_DIFF", "0.00"))
+                usd_pct = float(get_config("USDKRW_PCT", "0.00"))
+                delta_fx = f"{usd_diff:+.2f}원 ({usd_pct:+.2f}%)"
+                fx_time = get_config("USDKRW_UPDATE_TIME", "N/A")
+                
+                col1, col2, col3 = st.columns([1.5, 1.5, 2])
+                col1.metric(label="환율 (정규장 개장 09:30 ET 기준)", value=f"₩{usd_krw:,.2f}", delta=delta_fx)
+                with col1:
+                    st.caption(f"기준: 전일 개장 대비 | {fx_time}")
+                    if st.button("🔄 지금 환율 조회", key="manual_fx_update_inactive", help="현재 실시간 환율을 조회하여 임시 표시합니다. (공식 개장 환율 DB 미변경)"):
+                        with st.spinner("실시간 환율 조회 중..."):
+                            live_info = ActiveBroker.get_exchange_rate(force=True)
+                            st.session_state["manual_live_fx"] = {
+                                "rate": live_info.get("rate", 0.0),
+                                "time": datetime.now().strftime("%H:%M:%S"),
+                                "source": live_info.get("source", "KIWOOM")
+                            }
+                        st.rerun()
+                col2.write("")
+                col3.caption(f"⏱️ [{market_code}] 시장 운영 시간 외 | {datetime.now().strftime('%H:%M:%S')}")
+                
+                if "manual_live_fx" in st.session_state and st.session_state["manual_live_fx"].get("rate", 0) > 0:
+                    lfx = st.session_state["manual_live_fx"]
+                    st.info(f"🔍 **실시간 환율 (임시 조회)**: 1$ = **₩{lfx['rate']:,.2f}** (조회 시각: {lfx['time']}, 출처: {lfx['source']}) — *공식 개장 환율 DB는 변경되지 않습니다.*")
+
+                # 환율 변동 추이 그래프 (Expander)
+                render_exchange_rate_expander(market_code="US", key_suffix="inactive_header")
+                st.divider()
             return
         try:
             broker = ActiveBroker
@@ -2820,7 +2805,25 @@ if mode == "실전 투자":
                             f"📦 **예상 매수가능 수량**: **{qty_est}주** (현재가 {currency_symbol}{format_currency(current_price, market_code)} 기준)  \n"
                             f"⚠️ *Bootstrap 기간에는 매일 개장 30분 후에 시장가 주문이 자동으로 제출됩니다. 아래 지정가 예약은 참고용이며 자동 제출되지 않습니다.*"
                         )
-                    st.caption(f"보유 수량: {live_shares}주 | 사용 가능 현금: {currency_symbol}{format_currency(live_pool, market_code)} 기준")
+                    # 당일 주문 제출 시점의 고정 기준값 사용 (장중 체결로 인한 실시간 변동 방지)
+                    guide_v = state_data.get('cycle_V') or state_data.get('V') or current_v
+                    guide_pool = state_data.get('cycle_start_pool') or state_data.get('pool') or live_pool
+                    guide_shares = state_data.get('cycle_start_shares')
+                    if guide_shares is None or guide_shares <= 0:
+                        guide_shares = state_data.get('total_shares') or live_shares
+                    guide_date = state_data.get('last_order_date') or state_data.get('last_v_update_date') or datetime.now().strftime('%Y-%m-%d')
+                    
+                    guide_low_band = guide_v * (1 - (vr_band_pct / 100.0))
+                    guide_high_band = guide_v * (1 + (vr_band_pct / 100.0))
+
+                    st.caption(
+                        f"📌 **당일 발주 기준 상태** | "
+                        f"목표 V: **{currency_symbol}{format_currency(guide_v, market_code)}** "
+                        f"(Band: {currency_symbol}{format_currency(guide_low_band, market_code)} ~ {currency_symbol}{format_currency(guide_high_band, market_code)}) | "
+                        f"기준 Pool: **{currency_symbol}{format_currency(guide_pool, market_code)}** | "
+                        f"기준 수량: **{guide_shares:.0f}주** | "
+                        f"산출 기준일: **{guide_date}**"
+                    )
 
                     c1, c2 = st.columns(2)
                     
@@ -2836,13 +2839,13 @@ if mode == "실전 투자":
                             if "적립" in vr_invest_type_disp: pool_limit_ratio = 0.75
                             elif "인출" in vr_invest_type_disp: pool_limit_ratio = 0.25
                         
-                        max_use_pool = live_pool * pool_limit_ratio
+                        max_use_pool = guide_pool * pool_limit_ratio
                         used_pool = 0.0
                         
-                        target_val_buy = low_band - live_pool
+                        target_val_buy = guide_low_band - guide_pool
                         if target_val_buy > 0:
                             for n in range(1, 6): # 5호가 정도만 보여줌
-                                limit_price = target_val_buy / (live_shares + n)
+                                limit_price = target_val_buy / (guide_shares + n)
                                 if limit_price > 0 and used_pool + limit_price <= max_use_pool:
                                     buy_orders.append({"구분": f"매수 {n}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
                                     used_pool += limit_price
@@ -2857,12 +2860,12 @@ if mode == "실전 투자":
                     with c2:
                         st.markdown("**📈 매도 예약 (지정가)**")
                         sell_orders = []
-                        target_val_sell = high_band - live_pool
+                        target_val_sell = guide_high_band - guide_pool
                         
-                        if target_val_sell > 0 and live_shares > 0:
-                            for n in range(0, min(5, int(live_shares))):
-                                if (live_shares - n) > 0:
-                                    limit_price = target_val_sell / (live_shares - n)
+                        if target_val_sell > 0 and guide_shares > 0:
+                            for n in range(0, min(5, int(guide_shares))):
+                                if (guide_shares - n) > 0:
+                                    limit_price = target_val_sell / (guide_shares - n)
                                     sell_orders.append({"구분": f"매도 {n+1}차", f"가격 ({currency_symbol})": format_currency(limit_price, market_code), "수량": "1주"})
                             if sell_orders:
                                 st.table(pd.DataFrame(sell_orders))

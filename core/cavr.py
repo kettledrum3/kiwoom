@@ -732,6 +732,7 @@ class VRState(BaseState):
     # 사이클별 고정값
     cycle_V: float = 0.0
     cycle_start_pool: float = 0.0
+    cycle_start_shares: float = 0.0     # [ADD] 당일 주문 계산 기준 보유 주수
 
     # 당일 실행 추적 (중복 V값 재조정 및 중복 주문 방지용)
     last_v_update_date: str = ""
@@ -2212,6 +2213,13 @@ class ValueRebalancingEngine:
             if self.config.market == "KR": return f"{int(round(float(v))):,}"
             return f"{float(v):,.2f}"
 
+        # [ADD] 당일 주문 계산 기준 주수 및 Pool 고정 (대시보드 표시 및 당일 조건표 일관성 유지)
+        self.state.cycle_start_shares = shares
+        if not hasattr(self.state, 'cycle_start_pool') or self.state.cycle_start_pool <= 0:
+            self.state.cycle_start_pool = allocated_pool
+        if not hasattr(self.state, 'cycle_V') or self.state.cycle_V <= 0:
+            self.state.cycle_V = self.state.V
+
         logger.info(f"리밸런싱 주문 계산. 목표 V: {cur_sym}{fmt_price_val(self.state.cycle_V)}")
         # [ADD] SELL_LIMIT_ONLY 필터인 경우 매수 로직은 건너뜁니다.
         if order_filter == "SELL_LIMIT_ONLY":
@@ -2247,7 +2255,7 @@ class ValueRebalancingEngine:
                             success = self.broker.place_order(self.config.symbol, limit_price, 1, "SELL", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                             if success:
                                 submitted_sells.append({"desc": order_desc, "price": limit_price, "qty": 1})
-                            time.sleep(0.2) # API rate limit
+                            time.sleep(0.5) # API rate limit (안정적인 0.5초 딜레이)
                         else: # type: ignore
                             logger.info(f"-> [VR 매도] {limit_price} 동일 주문 존재. 스킵.")
 
@@ -2297,7 +2305,7 @@ class ValueRebalancingEngine:
                         success = self.broker.place_order(self.config.symbol, limit_price, 1, "BUY", price_type=ptype, strategy="VR", strategy_name=self.config.strategy_name)
                         if success:
                             submitted_buys.append({"desc": order_desc, "price": limit_price, "qty": 1})
-                        time.sleep(0.2) # API rate limit
+                        time.sleep(0.5) # API rate limit (안정적인 0.5초 딜레이)
                     used_pool += limit_price
         
         # 텔레그램 발주 결과 리포트 전송
