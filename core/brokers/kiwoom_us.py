@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import math
 import requests
 import logging
 from dotenv import load_dotenv
@@ -427,6 +428,20 @@ class KiwoomUsBroker(Broker):
                     return float(val)
         logger.error("[US] 예수금 조회 실패")
         return 0.0
+
+    def adjust_price_by_tick(self, symbol: str, price: float, order_type: Literal["BUY", "SELL"]) -> float:
+        """미국 주식 호가 보정: 부동소수점 오차 완벽 방어 (매수 올림, 매도 버림)"""
+        if price <= 0:
+            return 0.0
+
+        if price >= 1.0:
+            scaled = round(price * 100.0, 6)
+            result = math.ceil(scaled) if order_type == "BUY" else math.floor(scaled)
+            return result / 100.0
+        else:
+            scaled = round(price * 10000.0, 6)
+            result = math.ceil(scaled) if order_type == "BUY" else math.floor(scaled)
+            return result / 10000.0
 
     def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         """

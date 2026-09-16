@@ -1,4 +1,5 @@
 from typing import Tuple, List, Literal, Optional
+import math
 
 class Broker:
     def get_price(self, symbol: str) -> float:
@@ -25,8 +26,14 @@ class Broker:
         raise NotImplementedError
 
     def adjust_price_by_tick(self, symbol: str, price: float, order_type: Literal["BUY", "SELL"]) -> float:
-        """호가 단위에 맞게 가격 보정 (기본값은 소수점 2자리 반올림)"""
-        return round(price, 2)
+        """호가 단위에 맞게 가격 보정 (기본값은 미국 호가 단위 기준: 매수 올림, 매도 버림, 부동소수점 오차 방어)"""
+        if price <= 0:
+            return 0.0
+        scaled = round(price * 100.0, 6)
+        if order_type == "BUY":
+            return math.ceil(scaled) / 100.0
+        else:
+            return math.floor(scaled) / 100.0
         
     def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "00", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         raise NotImplementedError

@@ -186,16 +186,20 @@ def get_client_ip() -> str:
     except Exception:
         pass
 
+    # 구버전 Streamlit fallback (동적 import로 IDE 정적 분석 에러 방지)
     try:
-        from streamlit.web.server.websocket_headers import _get_websocket_headers
-        headers = _get_websocket_headers()
-        if headers:
-            fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
-            if fwd:
-                return fwd.split(",")[0].strip()
-            remote = headers.get("Remote-Addr") or headers.get("remote-addr")
-            if remote:
-                return remote.strip()
+        import importlib
+        ws_mod = importlib.import_module("streamlit.web.server.websocket_headers")
+        _get_websocket_headers = getattr(ws_mod, "_get_websocket_headers", None)
+        if _get_websocket_headers:
+            headers = _get_websocket_headers()
+            if headers:
+                fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+                if fwd:
+                    return fwd.split(",")[0].strip()
+                remote = headers.get("Remote-Addr") or headers.get("remote-addr")
+                if remote:
+                    return remote.strip()
     except Exception:
         pass
 
@@ -1263,10 +1267,12 @@ def display_holdings_metrics_live(symbol, strategy_choice, market_code, strategy
                     import math
                     state_obj = CAState(**state_data)
                     state_obj.avg_price = avg_price
-                    state_obj.total_shares = shares
-                    if state_obj.unit_buy_amount > 0:
+                    a_def = float(getattr(state_obj, 'a_default', 40) or 40)
+                    c_budget = float(getattr(state_obj, 'cycle_budget', 0.0) or 0.0)
+                    base_unit_buy = (c_budget / a_def) if (c_budget > 0 and a_def > 0) else float(state_obj.unit_buy_amount or 0)
+                    if base_unit_buy > 0:
                         invested = avg_price * shares
-                        state_obj.current_turn = math.ceil((invested / state_obj.unit_buy_amount) * 10) / 10.0
+                        state_obj.current_turn = math.ceil((invested / base_unit_buy) * 10) / 10.0
                     from core.database import save_state_db
                     save_state_db(state_obj, market=market_code, strategy_name=strategy_alias)
                 elif strategy_choice == "VR":
@@ -2077,10 +2083,13 @@ if mode == "실전 투자":
                         state_obj = CAState(**state_data)
                         state_obj.avg_price = avg_price
                         state_obj.total_shares = shares
-                        # T값 재계산 (현재 누적액 기준)
-                        if state_obj.unit_buy_amount > 0:
+                        # T값 재계산 (현재 누적액 기준, 기준분할매수금 분모 사용)
+                        a_def = float(getattr(state_obj, 'a_default', 40) or 40)
+                        c_budget = float(getattr(state_obj, 'cycle_budget', 0.0) or 0.0)
+                        base_unit_buy = (c_budget / a_def) if (c_budget > 0 and a_def > 0) else float(state_obj.unit_buy_amount or 0)
+                        if base_unit_buy > 0:
                             invested = avg_price * shares
-                            state_obj.current_turn = math.ceil((invested / state_obj.unit_buy_amount) * 10) / 10.0
+                            state_obj.current_turn = math.ceil((invested / base_unit_buy) * 10) / 10.0
                         save_state_db(state_obj, market=market_code, strategy_name=strategy_alias) # strategy_name도 함께 저장
                     elif strategy_choice == "VR":
                         import dataclasses
@@ -2320,11 +2329,13 @@ if mode == "실전 투자":
                         avg_price = live_info.get('avg_price', 0.0)
                         total_shares = live_shares_val
                         
-                        # T값이 0이거나 실제 잔고와 차이가 클 경우 재추정하여 표시
-                        # T = (평단 * 수량) / 1회매수금
-                        if unit_buy > 0:
+                        # T값이 0이거나 실제 잔고와 차이가 클 경우 재추정하여 표시 (기준분할매수금 분모 사용)
+                        a_def = float(state_data.get('a_default', db_a_default) or db_a_default or 40)
+                        c_budget = float(state_data.get('cycle_budget', 0.0) or 0.0)
+                        base_unit_buy = (c_budget / a_def) if (c_budget > 0 and a_def > 0) else unit_buy
+                        if base_unit_buy > 0:
                             invested_amt = avg_price * total_shares
-                            est_t = math.ceil((invested_amt / unit_buy) * 10) / 10.0
+                            est_t = math.ceil((invested_amt / base_unit_buy) * 10) / 10.0
                             if current_t == 0 or abs(current_t - est_t) > 0.5:
                                 current_t = est_t
                 
@@ -2359,11 +2370,14 @@ if mode == "실전 투자":
                             qty_avg = 1 # 최소 1주 매수
                         buy_rows.append({"구분": buy_label_1, f"가격 ({cur_sym})": format_currency(avg_price, market_code), "수량 (주)": qty_avg})
                     
-                    # LOC Star% 매수 (평단 * (1+Star) + Offset)
-                    # 주의: Star가 음수일 경우 평단보다 낮게 매수
+                    # LOC Star% 매수 (자전거래 방지 상한선 max_buy_allowed 적용)
                     if avg_price > 0:
-                        # 자전거래 방지를 위해 매수 가격에서 오프셋 차감 (KR: -10, US: -0.01)
-                        price_star = (avg_price * (1 + star_pct)) + (-10 if market_code == "KR" else -0.01)
+                        loc_offset = -10 if market_code == "KR" else -0.01
+                        loc_sell_ref = ActiveBroker.adjust_price_by_tick(symbol, avg_price * (1 + star_pct), "SELL")
+                        max_buy_allowed = ActiveBroker.adjust_price_by_tick(symbol, loc_sell_ref + loc_offset, "BUY")
+                        price_star_raw = (avg_price * (1 + star_pct)) + loc_offset
+                        star_buy_price = ActiveBroker.adjust_price_by_tick(symbol, price_star_raw, "BUY")
+                        price_star = min(star_buy_price, max_buy_allowed)
                         if price_star > 0:
                             qty_star = int((unit_buy * 0.5) / price_star)
                             if qty_star <= 0 and unit_buy > 0 and db_pool >= price_star:
@@ -2385,12 +2399,12 @@ if mode == "실전 투자":
                         qty_sell_25 = int(total_shares * 0.25)
                         qty_sell_75 = total_shares - qty_sell_25
 
-                        # Star% 매도 (오프셋 제거)
-                        price_sell_loc = avg_price * (1 + star_pct)
+                        # Star% 매도 (호가 보정)
+                        price_sell_loc = ActiveBroker.adjust_price_by_tick(symbol, avg_price * (1 + star_pct), "SELL")
                         sell_rows.append({"구분": sell_label_1, f"가격 ({cur_sym})": format_currency(price_sell_loc, market_code), "수량 (주)": qty_sell_25})
                         
-                        # 지정가 목표수익률 매도
-                        price_sell_limit = avg_price * (1 + db_target_profit)
+                        # 지정가 목표수익률 매도 (호가 보정)
+                        price_sell_limit = ActiveBroker.adjust_price_by_tick(symbol, avg_price * (1 + db_target_profit), "SELL")
                         sell_rows.append({"구분": f"지정가 {db_target_profit*100:.0f}% (75%)", f"가격 ({cur_sym})": format_currency(price_sell_limit, market_code), "수량 (주)": int(qty_sell_75)})
                         
                     st.table(pd.DataFrame(sell_rows))

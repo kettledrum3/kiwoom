@@ -592,13 +592,16 @@ class Broker:
         raise NotImplementedError
 
     def adjust_price_by_tick(self, symbol: str, price: float, order_type: Literal["BUY", "SELL"]) -> float:
-        """기본적으로는 소수점 2자리 반올림/올림/내림 처리 (시장별 오버라이드 가능)"""
+        """기본적으로는 소수점 2자리 반올림/올림/내림 처리 (시장별 오버라이드 가능, 부동소수점 오차 방어)"""
+        if price <= 0:
+            return 0.0
+        scaled = round(price * 100.0, 6)
         if order_type == "BUY":
             # 매수 시 호가 유리하게 올림 (미국 소수점 2자리 기준)
-            return math.ceil(price * 100) / 100.0
+            return math.ceil(scaled) / 100.0
         else:
             # 매도 시 보수적으로 내림
-            return math.floor(price * 100) / 100.0
+            return math.floor(scaled) / 100.0
 
 def kis_headers(tr_id: str, market: str = "US", custtype: str = "P", trade_mode: str = None) -> dict:
     token = get_access_token(market, trade_mode=trade_mode)
@@ -801,6 +804,7 @@ class CostAveragingEngine:
         self.planned_orders = []  # Preview 모드용 주문 저장소
         self.current_order_filter = None # "LIMIT_ONLY" or "LOC_ONLY"
         self.open_orders_pool = [] # 미체결 주문 비교용 풀
+        self._reverse_exited_today = False # 당일 리버스 복귀 후 재진입 방지 플래그
 
     def _is_already_ordered(self, side: str, price: float, qty: int) -> bool:
         """동일한 조건의 미체결 주문이 이미 존재하는지 확인 및 소모 (Preview용)"""
@@ -917,6 +921,16 @@ class CostAveragingEngine:
             mode="NORMAL"
         )
 
+    def _get_base_unit_buy_amount(self) -> float:
+        """T(회차) 계산의 기준이 되는 기준분할매수금 (cycle_budget / a_default)"""
+        a_def = self.config.a_default if self.config.a_default > 0 else 40
+        budget = self.state.cycle_budget if self.state.cycle_budget > 0 else self.config.initial_budget
+        if budget > 0 and a_def > 0:
+            return budget / a_def
+        if self.config.unit_buy_amount > 0:
+            return self.config.unit_buy_amount
+        return 250.0  # 기본 fallback
+
     def _update_current_turn_from_broker(self, shares=None, avg_price=None):
         """브로커 정보를 기반으로 회차(T)를 동기화합니다. 정보가 주어지면 API 호출을 생략합니다."""
         if shares is not None and avg_price is not None:
@@ -924,8 +938,9 @@ class CostAveragingEngine:
         else:
             cumulative_buy_amount = self.broker.get_cumulative_buy_amount(self.config.symbol) or 0.0
             
-        if self.config.unit_buy_amount > 0:
-            raw_turn = cumulative_buy_amount / self.config.unit_buy_amount
+        base_unit_buy = self._get_base_unit_buy_amount()
+        if base_unit_buy > 0:
+            raw_turn = cumulative_buy_amount / base_unit_buy
             self.state.current_turn = raw_turn # [V4.0 원칙] 반올림/올림 없음
 
     def _calculate_star_percent(self, turn: float) -> float:
@@ -1295,23 +1310,6 @@ class CostAveragingEngine:
                 return None
             logger.info(f"[{self.config.symbol}] SELL_LIMIT_ONLY 필터 적용. 매수 로직은 건너뜁니다.")
 
-        # [V4.0 전용] 유동적 1회 매수금 계산 및 리버스 모드 진입 판정
-        if self.config.version == "V4.0":
-            if self.state.mode != "REVERSE":
-                available_slots = self.config.a_default - self.state.current_turn
-                if available_slots > 0:
-                    # [중요] 1회 매수금을 매일 재계산하여 유동성 부여
-                    invested = self.state.total_shares * self.state.avg_price
-                    s_pool = max(0.0, self.state.pool - invested)
-                    self.config.unit_buy_amount = s_pool / available_slots
-                    self.state.unit_buy_amount = self.config.unit_buy_amount # 상태 필드도 업데이트
-                    logger.info(f"📍 [V4.0] 유동 매수액 재계산: {self.config.unit_buy_amount:,.2f} (s_pool: {s_pool:,.2f}, 남은회차: {available_slots:.2f})")
-                if self.state.current_turn >= (self.config.a_default - 1):
-                    if self.state.mode != "REVERSE" and not preview:
-                        send_telegram_message(f"🚨 <b>[CA V4.0 리버스 모드 가동]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n예산 소진(T >= {self.config.a_default - 1})에 따라 리버스 모드로 전환합니다.")
-                    self.state.mode = "REVERSE"
-                    self.state.reverse_cycle_count = 0
-
         # 시작 시 중복 주문 체크 (Preview일때는 무시하거나 체크만 로그)
         if check_existing_orders:
             self.open_orders_pool = self.broker.fetch_open_orders(self.config.symbol)
@@ -1361,7 +1359,32 @@ class CostAveragingEngine:
             if self.config.market == "KR" and order_filter == "SELL_LIMIT_ONLY":
                 return None
             return self._handle_cycle_finish_and_restart(current_price, date, preview)
-        
+
+        # [필수] NORMAL 모드일 때만 T값 최신화를 리버스 모드 판정보다 반드시 먼저 수행! (기준분할매수금 기준)
+        if self.state.mode != "REVERSE":
+            self._update_current_turn_from_broker(shares=shares, avg_price=avg_price)
+
+        # [V4.0 전용] 유동적 1회 매수금 계산 및 리버스 모드 진입 판정 (NORMAL 모드일 때만 이중 방어 검증)
+        if self.config.version == "V4.0" and self.state.mode != "REVERSE":
+            available_slots = self.config.a_default - self.state.current_turn
+            if available_slots > 0:
+                # [중요] 1회 매수금을 매일 재계산하여 유동성 부여
+                invested = self.state.total_shares * self.state.avg_price
+                s_pool = max(0.0, self.state.pool - invested)
+                self.config.unit_buy_amount = s_pool / available_slots
+                self.state.unit_buy_amount = self.config.unit_buy_amount # 상태 필드도 업데이트
+                logger.info(f"📍 [V4.0] 유동 매수액 재계산: {self.config.unit_buy_amount:,.2f} (s_pool: {s_pool:,.2f}, 남은회차: {available_slots:.2f})")
+
+            # 리버스 모드 진입 조건 검증: T >= a - 1 이고 손실률이 회복 기준 이하이며 당일 탈출 이력이 없을 때만 진입
+            if self.state.current_turn >= (self.config.a_default - 1):
+                recovery_threshold = -0.15 if "TQQQ" in self.config.symbol else -0.20
+                loss_pct = (current_price - self.state.avg_price) / self.state.avg_price if self.state.avg_price > 0 else 0
+                if not getattr(self, '_reverse_exited_today', False) and loss_pct <= recovery_threshold:
+                    if not preview:
+                        send_telegram_message(f"🚨 <b>[CA V4.0 리버스 모드 가동]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n예산 소진(T >= {self.config.a_default - 1}, 손실률 {loss_pct*100:.1f}%)에 따라 리버스 모드로 전환합니다.")
+                    self.state.mode = "REVERSE"
+                    self.state.reverse_cycle_count = 0
+
         # 3-1. 리버스 모드 로직 분기
         if self.state.mode == "REVERSE":
             return self._run_reverse_mode_routine(current_price, date, preview)
@@ -1396,9 +1419,10 @@ class CostAveragingEngine:
         if self.state.cycle_budget > 0:
             progress_rate = cumulative_buy_amount / self.state.cycle_budget
         
-        # T(회차) 계산 = 실제 누적 매수액 / 1회 매수 계획금액
-        if self.config.unit_buy_amount > 0:
-            raw_turn = cumulative_buy_amount / self.config.unit_buy_amount
+        # T(회차) 계산: 반드시 기준분할매수금(base_unit_buy)을 분모로 사용
+        base_unit_buy = self._get_base_unit_buy_amount()
+        if base_unit_buy > 0:
+            raw_turn = cumulative_buy_amount / base_unit_buy
             self.state.current_turn = raw_turn # [V4.0 원칙] 반올림/올림 없음
 
         # [ADD] 당일 로직 수행을 위한 T값 및 Star% 스냅샷 고정
@@ -1538,15 +1562,26 @@ class CostAveragingEngine:
         if self.state.avg_price > 0 and current_price >= escape_price:
             profit_rate = (current_price - self.state.avg_price) / self.state.avg_price
             logger.info(f"✨ 리버스 모드 종료 및 일반 모드 회귀 (현재가 {current_price:.2f} >= 탈출가 {escape_price:.2f}, 손익률 {profit_rate*100:.2f}% >= -{effective_target_pct*100:.2f}%)")
+            self.state.mode = "NORMAL"
+            self.state.reverse_cycle_count = 0
+            self._reverse_exited_today = True
+
+            # 복귀 시 V4.0 유동 매수액 재계산 (재귀 호출 없이 안전 갱신)
+            if self.config.version == "V4.0":
+                available_slots = self.config.a_default - self.state.current_turn
+                if available_slots > 0:
+                    invested = self.state.total_shares * self.state.avg_price
+                    s_pool = max(0.0, self.state.pool - invested)
+                    self.config.unit_buy_amount = s_pool / available_slots
+                    self.state.unit_buy_amount = self.config.unit_buy_amount
+
             if not preview:
                 send_telegram_message(
                     f"✨ <b>[CA V4.0 일반 모드 복귀]</b> {format_symbol_display(self.config.symbol, self.config.market)}\n"
                     f"주가 회복(현재가: {current_price:.2f} >= 탈출가: {escape_price:.2f}, 손익률: {profit_rate*100:.2f}%)에 따라 리버스 모드를 종료하고 일반 모드로 복귀합니다."
                 )
-            self.state.mode = "NORMAL"
-            self.state.reverse_cycle_count = 0
-            # 복귀 시 리버스 모드의 T값과 유동적 매수금 공식을 그대로 계승하여 즉시 일반 사이클 실행
-            return self.run_cycle(date, preview=preview, order_filter=self.current_order_filter)
+                self._save_and_finish(current_price=current_price)
+            return self.planned_orders if preview else None
 
         # 2. 리버스 별지점(MA5) 설정: 직전 5거래일 종가 평균
         ma5 = self.broker.get_last_5_day_avg_close(self.config.symbol)
@@ -1602,7 +1637,9 @@ class CostAveragingEngine:
             available_pool = self.state.pool if self.state.pool > 0 else 0.0
             if available_pool > 0:
                 buy_budget = available_pool * 0.25
-                buy_price = self._round_price(ma5 * 0.9999, "BUY")  # MA5 바로 아래 호가
+                buy_offset = -0.01 if self.config.market == "US" else -10
+                sell_ma5_ref = self._round_price(ma5, "SELL")
+                buy_price = self._round_price(sell_ma5_ref + buy_offset, "BUY")  # MA5 바로 아래 호가 (호가 오프셋 보장)
                 
                 if self.config.market == "US":
                     ptype = "30"  # 미국 정식 LOC 주문
@@ -1771,6 +1808,13 @@ class CostAveragingEngine:
                         self.state.quarter_turn += 1
             return
 
+        # [자전거래 방지] 매도 LOC 기준 호가 및 매수 상한선 산출 (매도 확정 호가 대비 최소 1틱 낮음 보장)
+        loc_sell_ref = self._round_price(base_price * (1.0 + star), "SELL")
+        max_buy_allowed = self._round_price(loc_sell_ref + loc_buy_offset, "BUY")
+        price_star_raw = (base_price * (1.0 + star)) + loc_buy_offset
+        star_buy_price = self._round_price(price_star_raw, "BUY")
+        limit_star_buy = min(star_buy_price, max_buy_allowed)
+
         # 2. 일반 모드 매수
         # 전반전 (진행률 < 50%)
         logger.debug(f"[DEBUG] 매수 루틴: Progress={progress_rate:.2f}, Star={star:.4f}, NextTurn={self.state.current_turn + 0.5}")
@@ -1785,14 +1829,14 @@ class CostAveragingEngine:
             if not preview:
                 time.sleep(0.5) # API 연속 호출 Rate Limit 방지
 
-            # 큰수 LOC: min(평단*(1+Star%), 현재가*1.15)
-            limit_price_2 = min((base_price * (1.0 + star)) + loc_buy_offset, current_price * 1.15)
+            # 큰수 LOC: min(limit_star_buy, 현재가*1.15)
+            limit_price_2 = min(limit_star_buy, current_price * 1.15)
             self._buy(half_amount, limit_price_2, f"(전반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
                 
         # 후반전 (진행률 >= 50%)
         else:
-            # 큰수 LOC: min(평단*(1+Star%), 현재가*1.15)
-            limit_price = min((base_price * (1.0 + star)) + loc_buy_offset, current_price * 1.15)
+            # 큰수 LOC: min(limit_star_buy, 현재가*1.15)
+            limit_price = min(limit_star_buy, current_price * 1.15)
             self._buy(self.config.unit_buy_amount, limit_price, f"(후반전) 큰수LOC 매수 ({ORDER_TYPE_MAP[ptype]})", turn=turn_to_log, price_type=ptype, preview=preview) # LOC
 
     def _save_and_finish(self, current_price: float = 0.0, silent: bool = False, shares=None, avg_price=None):

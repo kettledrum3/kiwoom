@@ -335,6 +335,110 @@ class TestReverseMode(unittest.TestCase):
         buy_order = next(o for o in planned if o["side"] == "BUY")
         self.assertEqual(buy_order["qty"], int(2500000.0 / 49990.0))
 
+    def test_v4_turn_not_exploding_with_dynamic_unit_buy(self):
+        """9. V4.0 동적 1회 매수금 축소 시에도 T(회차)가 기준분할매수금 기준으로 안정 유지되는지 검증 (T 폭등 버그 방지)"""
+        # 사이클 총 예산 $10,000, 40분할 -> base_unit_buy = $250
+        # 현재 누적 매수: 95주 * $100 = $9,500 (T = 38.0)
+        # 잔여 가용 풀: $200 (2슬롯 남음 -> 유동 매수액 = $100)
+        broker = MockBroker(price=95.0, shares=95.0, avg_price=100.0, pool=9700.0)
+        config = CAConfig(
+            symbol="TQQQ",
+            version="V4.0",
+            market="US",
+            a_default=40,
+            initial_budget=10000.0,
+            target_profit_pct=0.10,
+            use_db=False
+        )
+        engine = CostAveragingEngine(config, broker=broker)
+        engine.state = CAState(
+            symbol="TQQQ",
+            version="V4.0",
+            market="US",
+            current_turn=38.0,
+            total_shares=95.0,
+            avg_price=100.0,
+            pool=9700.0,
+            cycle_budget=10000.0,
+            unit_buy_amount=250.0,
+            mode="NORMAL"
+        )
+
+        # 사이클 실행 시 유동 매수액이 $100으로 줄어들더라도 T가 95로 튀지 않고 38.0을 유지해야 함
+        engine.run_cycle(datetime.now(), preview=True)
+        self.assertAlmostEqual(engine._get_base_unit_buy_amount(), 250.0, places=2)
+        self.assertAlmostEqual(engine.state.current_turn, 38.0, places=2)
+        # T가 38.0이므로 a - 1(39) 미만이어서 리버스 모드로 진입하지 않아야 함
+        self.assertEqual(engine.state.mode, "NORMAL")
+
+    def test_reverse_mode_exit_safety_and_flag(self):
+        """10. 리버스 모드 탈출 시 재귀 호출 없이 NORMAL 복귀 및 _reverse_exited_today 플래그 설정 검증"""
+        # 평단 100, 현재가 95 (손실률 -5.0% >= -10% 회복 조건 만족)
+        broker = MockBroker(price=95.0, shares=200.0, avg_price=100.0, pool=5000.0)
+        config = CAConfig(
+            symbol="TQQQ",
+            version="V4.0",
+            market="US",
+            a_default=40,
+            target_profit_pct=0.10,
+            use_db=False
+        )
+        engine = CostAveragingEngine(config, broker=broker)
+        engine.state = CAState(
+            symbol="TQQQ",
+            version="V4.0",
+            market="US",
+            current_turn=39.0,
+            total_shares=200.0,
+            avg_price=100.0,
+            pool=5000.0,
+            mode="REVERSE",
+            reverse_cycle_count=1
+        )
+
+        engine.run_cycle(datetime.now(), preview=False)
+        self.assertEqual(engine.state.mode, "NORMAL")
+        self.assertTrue(engine._reverse_exited_today)
+
+    def test_float_tick_rounding_defense(self):
+        """11. 호가 단위 보정 시 70.07이 70.06으로 절사되지 않고 70.07로 유지되는지 부동소수점 오차 검증"""
+        broker = MockBroker()
+        # MockBroker 호가 보정
+        sell_p = broker.adjust_price_by_tick("TQQQ", 70.07, "SELL")
+        buy_p = broker.adjust_price_by_tick("TQQQ", 70.07, "BUY")
+        self.assertEqual(sell_p, 70.07)
+        self.assertEqual(buy_p, 70.07)
+
+        from core.brokers.kiwoom_us import KiwoomUsBroker
+        from unittest.mock import MagicMock
+        us_broker = KiwoomUsBroker.__new__(KiwoomUsBroker)
+        us_sell = us_broker.adjust_price_by_tick("TQQQ", 70.07, "SELL")
+        us_buy = us_broker.adjust_price_by_tick("TQQQ", 70.07, "BUY")
+        self.assertEqual(us_sell, 70.07)
+        self.assertEqual(us_buy, 70.07)
+
+    def test_wash_trade_prevention_max_buy_allowed(self):
+        """12. 자전거래 방지 상한선 max_buy_allowed: 큰수 매수 가격이 매도 호가보다 최소 1센트 낮음 보장"""
+        base_price = 71.7781
+        star = -0.0237
+        loc_buy_offset = -0.01
+
+        broker = MockBroker()
+        loc_sell_ref = broker.adjust_price_by_tick("TQQQ", base_price * (1.0 + star), "SELL")
+        max_buy_allowed = broker.adjust_price_by_tick("TQQQ", loc_sell_ref + loc_buy_offset, "BUY")
+        
+        price_star_raw = (base_price * (1.0 + star)) + loc_buy_offset
+        star_buy_price = broker.adjust_price_by_tick("TQQQ", price_star_raw, "BUY")
+        limit_star_buy = min(star_buy_price, max_buy_allowed)
+
+        # base_price * (1+star) = 70.0769
+        # 매도 LOC: 70.07
+        # 매수 큰수LOC: 70.06 (70.07과 같아지지 않고 1센트 갭 보장!)
+        self.assertEqual(loc_sell_ref, 70.07)
+        self.assertEqual(limit_star_buy, 70.06)
+        self.assertLess(limit_star_buy, loc_sell_ref)
+
 
 if __name__ == "__main__":
     unittest.main()
+

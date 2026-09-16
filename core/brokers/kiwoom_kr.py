@@ -326,34 +326,34 @@ class KiwoomKrBroker(Broker):
         return 0.0
 
     def adjust_price_by_tick(self, symbol: str, price: float, order_type: Literal["BUY", "SELL"]) -> float:
+        if price <= 0:
+            return 0.0
+
         # ETF는 호가단위가 무조건 5원임 (한국 시장 기준)
         if symbol in self.etf_tickers or symbol.startswith("5") or symbol.startswith("1") or symbol.startswith("2") or symbol.startswith("3") or symbol.startswith("4"):
             tick = 5.0
-            if order_type == "BUY":
-                return math.ceil(price / tick) * tick
+        else:
+            # 일반 코스피/코스닥 주식 호가 단위 (마이그레이션용 기본값 유지)
+            if price < 2000:
+                tick = 1.0
+            elif price < 5000:
+                tick = 5.0
+            elif price < 20000:
+                tick = 10.0
+            elif price < 50000:
+                tick = 50.0
+            elif price < 200000:
+                tick = 100.0
+            elif price < 500000:
+                tick = 500.0
             else:
-                return math.floor(price / tick) * tick
-        
-        # 일반 코스피/코스닥 주식 호가 단위 (마이그레이션용 기본값 유지)
-        if price < 2000:
-            tick = 1.0
-        elif price < 5000:
-            tick = 5.0
-        elif price < 20000:
-            tick = 10.0
-        elif price < 50000:
-            tick = 50.0
-        elif price < 200000:
-            tick = 100.0
-        elif price < 500000:
-            tick = 500.0
-        else:
-            tick = 1000.0
+                tick = 1000.0
 
+        scaled = round(price / tick, 6)
         if order_type == "BUY":
-            return math.ceil(price / tick) * tick
+            return float(math.ceil(scaled) * tick)
         else:
-            return math.floor(price / tick) * tick
+            return float(math.floor(scaled) * tick)
 
     def place_order(self, symbol: str, price: float, qty: float, order_type: Literal["BUY", "SELL"], price_type: str = "0", strategy: str = "MANUAL", strategy_name: str = "", stop_price: Optional[float] = None) -> bool:
         """

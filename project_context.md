@@ -652,3 +652,45 @@
 *   **VR 당일 발주 기준값 보존 및 대시보드 주문 조건표 고정 표시**:
     - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `VRState`에 `cycle_start_shares` 필드를 추가하고, 당일 주문 제출 시점의 기준 주수(`cycle_start_shares`), Pool(`cycle_start_pool`), 목표 밸류(`cycle_V`)를 보존.
     - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 대시보드의 '🛒 예약 주문 가이드'가 장중 체결로 인한 실시간 잔고로 변동되지 않고, **당일 주문 시점의 기준값(`cycle_V`, `cycle_start_pool`, `cycle_start_shares`, `last_order_date`)을 바탕으로 조건표를 표시**하고 상단에 산출 기준 상태 및 날짜 메타데이터를 명시하도록 개선 (텔레그램 접수 내역과 100% 일치).
+
+### 📅 2026-09-02 ~ 2026-09-03 (주식 밸류 리밸런싱(VR) 전략의 암호화폐(업비트/빗썸) 이식 설계 및 전략 명세서 체계 구축)
+*   **주식 밸류 리밸런싱(VR) 전략의 암호화폐 마이그레이션**:
+    - strategy_formula.md에서 실력공식(Skill Formula) 및 밸류 리밸런싱(VR) 알고리즘을 추출하여 코인 시장(24시간 연중무휴, 소수점 수량 단위, 급격한 변동성)에 최적화된 전략으로 체계화.
+*   **거래소별 특화 및 통합 명세서 4종 구축 및 배포**:
+    - [strategy_CA4_for_Coin.md](file:///d:/Python_D/kiwoom/strategy_CA4_for_Coin.md): CA V4.0 가변 사이클(4h/6h/8h/12h/24h) 및 빗썸 최소 주문금액(5,000 KRW) 일원화 반영.
+    - [strategy_VR_for_upbit.md](file:///d:/Python_D/kiwoom/strategy_VR_for_upbit.md): 업비트(Upbit) 특화 밸류 리밸런싱 명세서 (최소 5,000원, 업비트 신규 틱룰, JWT 인증, 10단계 밴드 분할 매수/매도).
+    - [strategy_VR_for_bithumb.md](file:///d:/Python_D/kiwoom/strategy_VR_for_bithumb.md): 빗썸(Bithumb) 특화 밸류 리밸런싱 명세서 (공식 최소 5,000 KRW 전수 일원화, HMAC-SHA512 서명, 틱룰).
+    - [strategy_VR_for_Coin.md](file:///d:/Python_D/kiwoom/strategy_VR_for_Coin.md): **[최종 표준 통합본]** 거래소 공통 엔진(CoinVR) 및 어댑터 패턴(ExchangeAdapter) 기반 통합 명세서.
+*   **코인형 VR 핵심 설계 혁신**:
+    - **가변 사이클 타임 (Cycle Period)**: 1일(24h), 2일(48h), 4일(96h), 일주일(7일) 선택 옵션 제공.
+    - **일일 목표 밸류($) 갱신 시각 지정**: 하루 중  재계산 및 10단계 밴드 주문 재배치 시각을 사용자가 직접 지정 (기본값: 22:00 KST).
+    - **코인 맞춤형 10단계 밴드 주문**: 정수 1주 단위 매매 대신, 가용 Pool의  금액 기반으로 Low Band( \times 0.85$) 아래/High Band( \times 1.15$) 위로 10단계 점진 분할 배치.
+    - **Bootstrap (초기 시드 분할 진입) 모드**: 초기 원화 비중 과다 시 10일/5일 균등 분할 매수 후 정규 리밸런싱 모드로 자동 전환.
+*   **대시보드 및 시스템 아키텍처 연계**:
+    - 대시보드 메인 탭에 **[ 💎 밸류 리밸런싱 VR ]** 신설 및 수익 분석 서브 탭 분리([ 💎 VR 수익분석 ]).
+    - 사이드바 4대 제어 버튼(⏸️ 일시정지, ▶️ 다시시작, 🔄 동기화, 🛑 종료) 및 is_running 메타데이터 기반 안전 복구 정책 일원화.
+    - 건당 50만원 분할 발주, 0.2초 rate limit 딜레이, 소수점 4자리 절사(math.floor(q * 10000) / 10000.0), 웹소켓+REST 교차 검증 체결 안전장치 내장.
+*   **프로젝트 간 동기화**: kiwoom, grid_trading_cc, gridbithumb 3개 워크스페이스에 모든 최신 전략 명세서 100% 동기화 배포.
+
+### 📅 2026-09-16 ~ 2026-09-17 (무한매수법 CA V4.0 전략 결함 전면 보완, 키움 전략 가이드 구축 및 Streamlit 호환성 개선)
+*   **V4.0 회차($T$) 산출 기준분할매수금(`base_unit_buy`) 분모 통일**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py), [core/database.py](file:///d:/Python_D/kiwoom/core/database.py), [core/ws_client.py](file:///d:/Python_D/kiwoom/core/ws_client.py), [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 잔여 풀에 따라 매일 축소되는 유동 1회 매수금(`unit_buy_amount = s_pool / (a - T)`)을 회차 계산의 분모로 나누어 $T$가 38~80 이상으로 비정상 폭등하던 버그를 전면 수정함.
+    - 엔진 내부(`_get_base_unit_buy_amount`), DB 체결 동기화(`sync_trade_history_db`), 웹소켓 체결, 대시보드 상태 동기화 및 T 재추정 로직 전체에 `base_unit_buy = cycle_budget / a_default`를 고정 분모로 일원화 적용.
+*   **리버스 모드(Reverse Mode) 안전 상태 머신 및 무한 재귀 루프 차단**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 리버스 탈출 시 `return self.run_cycle()` 재귀 호출을 전면 제거하고 `_reverse_exited_today = True` 플래그를 설정하여 핑퐁 재귀 무한 루프를 원천 차단함. 탈출 시 재귀 호출 없이 유동 매수액(`unit_buy_amount`)을 안전하게 계산하여 상태에 반영함.
+    - `run_cycle`에서 NORMAL 모드일 때만 브로커 기준 $T$ 최신화 및 리버스 진입 판정을 수행하도록 가드를 적용하여, 리버스 진행 중 고유 $T$ 수식이 보존되도록 보장함. 리버스 진입 조건에 주가 손실률 사전 검증(`loss_pct <= recovery_threshold`)을 추가함.
+*   **호가 단위 보정 시 부동소수점 절사(Floor) 오차 방어**:
+    - [core/brokers/base.py](file:///d:/Python_D/kiwoom/core/brokers/base.py), [core/brokers/kiwoom_us.py](file:///d:/Python_D/kiwoom/core/brokers/kiwoom_us.py), [core/brokers/kiwoom_kr.py](file:///d:/Python_D/kiwoom/core/brokers/kiwoom_kr.py), [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): `70.07 * 100 = 7006.999999999999`로 인해 `$70.07` 매도 호가가 `$70.06`으로 1센트 깎이던 파이썬 부동소수점 오차를 `scaled = round(price * 100.0, 6)`(미국) 및 `scaled = round(price / tick, 6)`(한국) 정규화 후 `math.ceil`/`math.floor`를 적용하도록 수정함. 미국 브로커에도 `adjust_price_by_tick`을 정식 탑재함.
+*   **자전거래 방지 오프셋 상쇄 방지 및 매수 상한 제약(`max_buy_allowed`) 적용**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py), [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): 매수 올림(`ceil`) 처리에 의해 Star% 매수 가격이 매도 가격과 동일해지거나 역전되는 현상을 방지하고자, 매도 확정 호가 대비 최소 1틱 낮음을 보장하는 `max_buy_allowed = adjust_price_by_tick(loc_sell_ref + loc_buy_offset, "BUY")` 상한선을 백엔드 엔진과 UI 조건표 모두에 적용함.
+    - 리버스 쿼터 매수 가격 산출 시에도 $MA5$ 대비 1틱 아래(`sell_ma5_ref + buy_offset`) 호가가 보장되도록 개선함.
+*   **단위 테스트 4종 신규 추가 및 총 24개 테스트 100% 통과**:
+    - [test_reverse_mode.py](file:///d:/Python_D/kiwoom/test_reverse_mode.py): 유동 매수금 축소 시 T 안정성, 리버스 탈출 안전성 및 플래그, 부동소수점 호가 보정 방어, 자전거래 상한 제약 테스트 4종을 추가하여 총 12개 리버스 테스트 및 전체 24개 회귀 테스트 100% 통과(`OK`) 완료.
+*   **[Strategy_CA_for_kiwoom.md](file:///d:/Python_D/kiwoom/Strategy_CA_for_kiwoom.md) 전략 가이드 체계 구축 및 배포**:
+    - 타 프로젝트(토스증권, KIS) 실전 검증 결과를 바탕으로 무한매수법(CA V2.2 / V4.0) 키움증권 자동매매 시스템 전용 이식 및 전략 구현 가이드(v1.1) 작성.
+    - 5대 실전 결함(T 산출 왜곡, 리버스 무한 루프, 부동소수점 호가 절사, 자전거래 방지 상쇄, UI 불일치) 방지 원칙 및 완벽한 검증 코드 스니펫 집약.
+*   **Streamlit 최신 버전(v1.58+) 호환 및 정적 분석(Pyright/Pylance) 에러 수정**:
+    - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): `get_client_ip()`에서 비공개 내부 모듈인 `streamlit.web.server.websocket_headers` 정적 임포트로 인해 발생하던 `Cannot find module` IDE 경고/오류 해결.
+    - 최신 공식 표준인 `st.context.headers` 우선 처리를 유지하고 구버전 fallback을 `importlib.import_module`을 통한 동적 임포트로 안전하게 캡슐화하여 정적 분석 오류 제거 및 환경 호환성 확보.
+
+
