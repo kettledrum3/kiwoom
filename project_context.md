@@ -693,4 +693,13 @@
     - [dashboard.py](file:///d:/Python_D/kiwoom/dashboard.py): `get_client_ip()`에서 비공개 내부 모듈인 `streamlit.web.server.websocket_headers` 정적 임포트로 인해 발생하던 `Cannot find module` IDE 경고/오류 해결.
     - 최신 공식 표준인 `st.context.headers` 우선 처리를 유지하고 구버전 fallback을 `importlib.import_module`을 통한 동적 임포트로 안전하게 캡슐화하여 정적 분석 오류 제거 및 환경 호환성 확보.
 
+### 📅 2026-09-28 (2026년 추석 대체공휴일 캘린더 오류 교정 및 키움증권 휴장일 API 분석)
+*   **2026년 추석 대체공휴일 캘린더 오류 수정 및 DB 개장 여부 동기화**:
+    - [core/cavr.py](file:///d:/Python_D/kiwoom/core/cavr.py): 2026년 추석 연휴(9월 24일 목 ~ 9월 26일 토)는 일요일(27일)과 겹치지 않아 법령(관공서의 공휴일에 관한 규정)상 대체공휴일 적용 대상이 아님에도, `KR_MARKET_HOLIDAYS[2026]`에 `(9, 28), # 추석 대체공휴일`이 잘못 등록되어 있던 오류를 수정(제거).
+    - [core/database.py](file:///d:/Python_D/kiwoom/core/database.py): 스케줄러에 의해 휴장(`N`)으로 저장되었던 DB `system_config` 테이블의 `kr_market_opnd_yn` 키를 정상 개장일(`Y`)로 즉시 갱신 및 `fetch_kr_holiday()` 정상 동작(`True`) 검증 완료.
+*   **키움증권 REST API 명세 전수 조사 및 휴장일 관리 정책 확인**:
+    - `API_SPEC.md` 및 공식 명세서(전체 338개 TR)를 전수 분석하여, 키움증권 REST API는 타 증권사와 달리 날짜별 휴장일/영업일을 사전 조회할 수 있는 전용 TR을 제공하지 않음을 확인.
+    - 실시간 웹소켓 `장시작시간(0s)` 패킷은 장 시작 직전(08:40, 09:00 등)에 수신되므로 사전 스케줄링 용도로 부적합함을 판별하고, 현행 자체 캘린더(`core/cavr.py`) 및 사용자 정의 휴일(`env/custom_holidays.json`) 기반 판별 후 DB 캐싱 구조를 유지하기로 확정.
+
+
 
